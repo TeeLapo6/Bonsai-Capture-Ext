@@ -1,0 +1,153 @@
+{
+  "browsers": {
+    "Chrome": {
+      "latest": {
+        "status": "stable",
+        "features": [
+          "content_script",
+          "background_script",
+          "storage_sync",
+          "web_request"
+        ]
+      },
+      "beta": {
+        "status": "stable",
+        "features": [
+          "content_script",
+          "background_script",
+          "storage_sync",
+          "web_request",
+          "chrome.tabs"
+        ]
+      },
+      "dev": {
+        "status": "experimental",
+        "features": [
+          "content_script",
+          "background_script",
+          "storage_sync",
+          "web_request",
+          "chrome.tabs",
+          "chrome.devtools"
+        ]
+      }
+    },
+    "Firefox": {
+      "latest": {
+        "status": "stable",
+        "features": [
+          "content_script",
+          "background_script",
+          "storage_sync",
+          "web_request"
+        ]
+      },
+      "beta": {
+        "status": "stable",
+        "features": [
+          "content_script",
+          "background_script",
+          "storage_sync",
+          "web_request",
+          "browser.tabs"
+        ]
+      },
+      "dev": {
+        "status": "experimental",
+        "features": [
+          "content_script",
+          "background_script",
+          "storage_sync",
+          "web_request",
+          "browser.tabs",
+          "browser.devtools"
+        ]
+      }
+    },
+    "Safari": {
+      "latest": {
+        "status": "stable",
+        "features": [
+          "content_script",
+          "background_script",
+          "storage_sync"
+        ]
+      },
+      "beta": {
+        "status": "stable",
+        "features": [
+          "content_script",
+          "background_script",
+          "storage_sync",
+          "safari.extension"
+        ]
+      }
+    },
+    "Edge": {
+      "latest": {
+        "status": "stable",
+        "features": [
+          "content_script",
+          "background_script",
+          "storage_sync",
+          "web_request"
+        ]
+      }
+    }
+  },
+  "features": {
+    "content_script": {
+      "description": "Injects scripts into web pages",
+      "supported": true,
+      "all_browsers": true
+    },
+    "background_script": {
+      "description": "Background page for extension logic",
+      "supported": true,
+      "all_browsers": true
+    },
+    "storage_sync": {
+      "description": "Syncs data across devices",
+      "supported": true,
+      "all_browsers": true
+    },
+    "web_request": {
+      "description": "Intercepts network requests",
+      "supported": true,
+      "all_browsers": true
+    },
+    "chrome.tabs": {
+      "description": "Chrome-specific tab API",
+      "supported": true,
+      "all_browsers": false
+    },
+    "browser.tabs": {
+      "description": "Firefox-specific tab API",
+      "supported": true,
+      "all_browsers": false
+    },
+    "chrome.devtools": {
+      "description": "Chrome devtools API",
+      "supported": true,
+      "all_browsers": false
+    },
+    "browser.devtools": {
+      "description": "Firefox devtools API",
+      "supported": true,
+      "all_browsers": false
+    },
+    "safari.extension": {
+      "description": "Safari-specific extension API",
+      "supported": true,
+      "all_browsers": false
+    }
+  },
+  "testing": {
+    "automated": true,
+    "manual": true,
+    "cross_browser": true,
+    "continuous_integration": true
+  },
+  "last_updated": "2026-03-06",
+  "version": "1.0.0"
+}
