@@ -26,10 +26,15 @@ Each run creates `runs/run_<timestamp>/` and writes:
 - `extension_console.log`
 - `capture_raw.json`
 - `capture_parsed.json`
+- `export_graph.json`
+- `export_markdown.md`
+- `export_package.json`
+- `export_toon.json`
+- `export_validation.json`
 - `checksums.txt`
 - `reproduction.md`
 - `performance.json`
 - `stress_results.json`
 - `certification.md`
 
-The harness currently validates smoke-level navigation and emits the Week 2 run artifacts. Provider-specific login/bootstrap, export round-trip checks, and scale workloads still need dedicated suites.
+The harness now validates smoke-level navigation and emits a canonical export-certification bundle alongside the Week 2 run artifacts. Provider-specific login/bootstrap, provider-derived export round-trip checks, and scale workloads still need dedicated suites.

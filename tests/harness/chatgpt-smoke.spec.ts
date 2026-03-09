@@ -11,6 +11,7 @@ import {
   writeChecksums,
   writeJsonArtifact,
 } from './utils/artifacts';
+import { writeExportValidationArtifacts } from './utils/exportValidation';
 
 type SmokeFixture = {
   name: string;
@@ -61,6 +62,7 @@ test('creates a ChatGPT smoke harness run folder', async () => {
   let finalUrl = targetUrl;
   let pageLoaded = false;
   let validationPassed = false;
+  let exportValidationPassed = false;
   let failureMessage: string | null = null;
   const consoleMessages: string[] = [];
 
@@ -87,6 +89,8 @@ test('creates a ChatGPT smoke harness run folder', async () => {
     const finishedAt = new Date().toISOString();
     const durationMs = Math.round(performance.now() - startedAtMs);
     const browserVersion = context.browser()?.version() ?? 'chromium-channel';
+    const exportValidation = await writeExportValidationArtifacts(runDir);
+    exportValidationPassed = exportValidation.passed;
 
     await writeArtifact(runDir, 'extension_console.log', `${consoleMessages.join('\n')}\n`);
     await writeJsonArtifact(runDir, 'capture_raw.json', {
@@ -158,7 +162,7 @@ test('creates a ChatGPT smoke harness run folder', async () => {
         '# Week 2 Certification Status',
         '',
         `- Smoke harness validation: ${validationPassed ? 'pass' : 'fail'}`,
-        '- Export certification: pending dedicated round-trip coverage',
+        `- Export certification: ${exportValidationPassed ? 'pass' : 'fail'}`,
         '- Performance benchmarking: pending dedicated benchmark suite',
         '- Stress testing: pending dedicated scale suite',
         `- Failure detail: ${failureMessage ?? 'none'}`,
@@ -171,6 +175,11 @@ test('creates a ChatGPT smoke harness run folder', async () => {
         artifactPaths.extensionConsole,
         artifactPaths.captureRaw,
         artifactPaths.captureParsed,
+        artifactPaths.exportGraph,
+        artifactPaths.exportMarkdown,
+        artifactPaths.exportPackage,
+        artifactPaths.exportToon,
+        artifactPaths.exportValidation,
         artifactPaths.reproduction,
         artifactPaths.performance,
         artifactPaths.stressResults,
