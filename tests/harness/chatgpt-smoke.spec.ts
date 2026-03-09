@@ -104,7 +104,7 @@ test('creates a ChatGPT smoke harness run folder', async () => {
       validation_passed: validationPassed,
       checks: {
         url_match: /chatgpt\.com|chat\.openai\.com/.test(finalUrl),
-        page_loaded,
+        page_loaded: pageLoaded,
       },
       page_title: pageTitle,
       console_message_count: consoleMessages.length,
