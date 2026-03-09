@@ -1,0 +1,11 @@
+{
+  "name": "chatgpt-smoke",
+  "url": "https://chatgpt.com/",
+  "prompt": "Create a short numbered list about branch testing.",
+  "captureTarget": "latest-conversation",
+  "artifacts": [
+    "harness.log",
+    "extension_console.log",
+    "reproduction.md"
+  ]
+}

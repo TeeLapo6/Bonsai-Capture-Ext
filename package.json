@@ -8,6 +8,8 @@
         "build": "tsc && node build.js",
         "preview": "vite preview",
         "test": "vitest",
+        "test:harness": "node ./node_modules/playwright/cli.js test tests/harness",
+        "test:harness:headed": "node ./node_modules/playwright/cli.js test tests/harness --headed",
         "lint": "eslint src --ext ts,tsx"
     },
     "dependencies": {
@@ -23,6 +25,7 @@
         "zustand": "^4.4.0"
     },
     "devDependencies": {
+        "@playwright/test": "^1.58.2",
         "@types/chrome": "^0.0.260",
         "@types/jszip": "^3.4.0",
         "@types/node": "^25.0.3",
