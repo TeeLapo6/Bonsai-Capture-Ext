@@ -1,99 +1,122 @@
 {
-    "manifest_version": 3,
-    "name": "Bonsai Capture",
-    "version": "0.1.0",
-    "description": "Capture AI chat conversations and import them into Bonsai",
-    "permissions": [
-        "activeTab",
-        "scripting",
-        "sidePanel",
-        "storage",
-        "declarativeNetRequest"
-    ],
-    "externally_connectable": {
-        "matches": [
-            "http://localhost/*",
-            "http://127.0.0.1/*",
-            "http://localhost:3000/*",
-            "http://127.0.0.1:3000/*",
-            "http://localhost:8080/*",
-            "http://127.0.0.1:8080/*",
-            "https://*.bonsai.app/*"
-        ]
-    },
-    "host_permissions": [
+  "manifest_version": 3,
+  "name": "Bonsai Capture",
+  "version": "0.1.0",
+  "description": "Capture AI chat conversations and import them into Bonsai",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "sidePanel",
+    "storage",
+    "declarativeNetRequest"
+  ],
+  "externally_connectable": {
+    "matches": [
+      "http://localhost/*",
+      "http://127.0.0.1/*",
+      "http://localhost:3000/*",
+      "http://127.0.0.1:3000/*",
+      "http://localhost:8080/*",
+      "http://127.0.0.1:8080/*",
+      "https://*.bonsai.app/*"
+    ]
+  },
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "https://claude.ai/*",
+    "https://gemini.google.com/*",
+    "https://grok.com/*",
+    "https://*.oaiusercontent.com/*",
+    "https://files.oaiusercontent.com/*",
+    "https://*.googleusercontent.com/*",
+    "https://*.ggpht.com/*",
+    "https://*.google.com/*",
+    "https://jules.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
         "https://chatgpt.com/*",
         "https://chat.openai.com/*",
-        "https://claude.ai/*",
-        "https://gemini.google.com/*",
-        "https://grok.com/*",
-        "https://files.oaiusercontent.com/*",
-        "https://*.googleusercontent.com/*",
-        "https://*.ggpht.com/*",
-        "https://*.google.com/*"
-    ],
-    "background": {
-        "service_worker": "background.js",
-        "type": "module"
+        "https://*.oaiusercontent.com/*"
+      ],
+      "js": [
+        "content/chatgpt_probe.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
     },
-    "side_panel": {
-        "default_path": "sidepanel.html"
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "content/chatgpt.js"
+      ],
+      "run_at": "document_idle"
     },
-    "content_scripts": [
-        {
-            "matches": [
-                "https://chatgpt.com/*",
-                "https://chat.openai.com/*"
-            ],
-            "js": [
-                "content/chatgpt.js"
-            ],
-            "run_at": "document_idle"
-        },
-        {
-            "matches": [
-                "https://claude.ai/*"
-            ],
-            "js": [
-                "content/claude.js"
-            ],
-            "run_at": "document_idle"
-        },
-        {
-            "matches": [
-                "https://gemini.google.com/*"
-            ],
-            "js": [
-                "content/gemini.js"
-            ],
-            "run_at": "document_idle"
-        },
-        {
-            "matches": [
-                "https://grok.com/*"
-            ],
-            "js": [
-                "content/grok.js"
-            ],
-            "run_at": "document_idle"
-        },
-        {
-            "matches": [
-                "http://localhost/*",
-                "http://127.0.0.1/*",
-                "http://localhost:3000/*",
-                "http://127.0.0.1:3000/*",
-                "http://localhost:8080/*",
-                "http://127.0.0.1:8080/*",
-                "https://*.bonsai.app/*"
-            ],
-            "js": [
-                "content/bonsai_webui.js"
-            ],
-            "run_at": "document_start"
-        }
-    ],
-    "action": {
-        "default_title": "Open Bonsai Capture"
+    {
+      "matches": [
+        "https://claude.ai/*"
+      ],
+      "js": [
+        "content/claude.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://gemini.google.com/*"
+      ],
+      "js": [
+        "content/gemini.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://grok.com/*"
+      ],
+      "js": [
+        "content/grok.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "http://localhost/*",
+        "http://127.0.0.1/*",
+        "http://localhost:3000/*",
+        "http://127.0.0.1:3000/*",
+        "http://localhost:8080/*",
+        "http://127.0.0.1:8080/*",
+        "https://*.bonsai.app/*"
+      ],
+      "js": [
+        "content/bonsai_webui.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://jules.google.com/*"
+      ],
+      "js": [
+        "content/jules.js"
+      ],
+      "run_at": "document_start"
     }
+  ],
+  "action": {
+    "default_title": "Open Bonsai Capture"
+  }
 }

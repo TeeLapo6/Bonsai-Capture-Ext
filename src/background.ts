@@ -144,6 +144,500 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true; // Async response
     }
 
+    if (message.type === 'FETCH_REMOTE_RESOURCE') {
+        (async () => {
+            const logs: string[] = [];
+
+            try {
+                logs.push(`Background resource fetch: ${String(message.url).slice(0, 80)}...`);
+
+                const response = await fetch(message.url, {
+                    credentials: 'include',
+                    redirect: 'follow',
+                    headers: {
+                        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,application/json;q=0.7,*/*;q=0.5'
+                    }
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Background fetch failed: ${response.status} ${response.statusText}`);
+                }
+
+                const contentType = response.headers.get('content-type') ?? 'application/octet-stream';
+                const contentDisposition = response.headers.get('content-disposition') ?? undefined;
+                const normalizedType = contentType.split(';')[0].trim().toLowerCase();
+
+                if (
+                    normalizedType.startsWith('text/')
+                    || normalizedType.includes('json')
+                    || normalizedType.includes('xml')
+                    || normalizedType.includes('javascript')
+                    || normalizedType.includes('svg')
+                ) {
+                    const text = await response.text();
+                    sendResponse({
+                        ok: true,
+                        text,
+                        contentType,
+                        contentDisposition,
+                        finalUrl: response.url,
+                        logs,
+                    });
+                    return;
+                }
+
+                const blob = await response.blob();
+                const reader = new FileReader();
+                reader.onloadend = () => {
+                    sendResponse({
+                        ok: true,
+                        dataUrl: reader.result as string,
+                        contentType,
+                        contentDisposition,
+                        finalUrl: response.url,
+                        logs,
+                    });
+                };
+                reader.onerror = () => {
+                    sendResponse({
+                        ok: false,
+                        error: String(reader.error ?? 'FileReader failed'),
+                        logs,
+                    });
+                };
+                reader.readAsDataURL(blob);
+            } catch (error) {
+                logs.push(`Background error: ${error}`);
+                sendResponse({
+                    ok: false,
+                    error: String(error),
+                    logs,
+                });
+            }
+        })();
+        return true;
+    }
+
+    if (message.type === 'EXTRACT_ALL_FRAMES') {
+        (async () => {
+            if (!sender.tab?.id) {
+                sendResponse({ frames: [], error: 'Missing sender tab id' });
+                return;
+            }
+
+            try {
+                const results = await chrome.scripting.executeScript({
+                    target: {
+                        tabId: sender.tab.id,
+                        allFrames: true,
+                    },
+                    func: () => {
+                        const body = document.body;
+
+                        return {
+                            url: window.location.href,
+                            title: document.title ?? '',
+                            text: body?.innerText ?? body?.textContent ?? '',
+                            html: body?.innerHTML ?? '',
+                            isTop: window.top === window,
+                        };
+                    },
+                });
+
+                sendResponse({
+                    frames: results
+                        .map((result) => ({
+                            frameId: result.frameId,
+                            ...(result.result ?? {
+                                url: '',
+                                title: '',
+                                text: '',
+                                html: '',
+                                isTop: false,
+                            }),
+                        }))
+                        .filter((frame) => typeof frame.url === 'string' && (frame.text || frame.html)),
+                });
+            } catch (error) {
+                sendResponse({
+                    frames: [],
+                    error: String(error),
+                });
+            }
+        })();
+        return true;
+    }
+
+    if (message.type === 'INSTALL_OPENAI_RESEARCH_PROBE') {
+        (async () => {
+            if (!sender.tab?.id) {
+                sendResponse({ success: false, error: 'Missing sender tab id' });
+                return;
+            }
+
+            try {
+                await chrome.scripting.executeScript({
+                    target: {
+                        tabId: sender.tab.id,
+                        frameIds: typeof sender.frameId === 'number' ? [sender.frameId] : undefined,
+                    },
+                    world: 'MAIN',
+                    func: () => {
+                        const globalObject = window as Window & {
+                            __bonsaiOpenAIResearchProbeInstalled?: boolean;
+                            __bonsaiOpenAIResearchProbe?: {
+                                entries: Array<{
+                                    kind: string;
+                                    url: string;
+                                    contentType?: string;
+                                    body: string;
+                                    timestamp: number;
+                                    status?: number;
+                                }>;
+                            };
+                            __bonsaiOpenAIResearchProbeFetch?: typeof fetch;
+                            __bonsaiOpenAIResearchProbeWindowPostMessage?: typeof window.postMessage;
+                            __bonsaiOpenAIResearchProbePortPostMessage?: typeof MessagePort.prototype.postMessage;
+                            __bonsaiOpenAIResearchProbeXHROpen?: typeof XMLHttpRequest.prototype.open;
+                            __bonsaiOpenAIResearchProbeXHRSend?: typeof XMLHttpRequest.prototype.send;
+                        };
+
+                        if (globalObject.__bonsaiOpenAIResearchProbeInstalled) {
+                            return;
+                        }
+                        globalObject.__bonsaiOpenAIResearchProbeInstalled = true;
+
+                        const MAX_ENTRIES = 40;
+                        const MAX_BODY_LENGTH = 250000;
+                        const bodyPattern = /deep[_-]?research|connector_openai_deep_research|ecosystem\/widget|executive summary|citations|searches|sources|report|analysis|markdown/i;
+                        const cache = globalObject.__bonsaiOpenAIResearchProbe ?? { entries: [] };
+                        globalObject.__bonsaiOpenAIResearchProbe = cache;
+
+                        const normalizeBody = (body: string): string => body.slice(0, MAX_BODY_LENGTH);
+                        const shouldTrack = (url: string, body: string, contentType: string): boolean => {
+                            const bodyPreview = body.slice(0, 4000);
+                            return bodyPattern.test(`${url}\n${contentType}\n${bodyPreview}`);
+                        };
+
+                        const pushEntry = (entry: {
+                            kind: string;
+                            url: string;
+                            contentType?: string;
+                            body: string;
+                            timestamp: number;
+                            status?: number;
+                        }) => {
+                            const normalizedBody = normalizeBody(entry.body || '');
+                            if (!normalizedBody) {
+                                return;
+                            }
+
+                            const dedupeKey = `${entry.kind}|${entry.url}|${normalizedBody.slice(0, 1200)}`;
+                            if (cache.entries.some((existing) => `${existing.kind}|${existing.url}|${existing.body.slice(0, 1200)}` === dedupeKey)) {
+                                return;
+                            }
+
+                            cache.entries.unshift({
+                                ...entry,
+                                body: normalizedBody,
+                            });
+                            cache.entries = cache.entries.slice(0, MAX_ENTRIES);
+                        };
+
+                        const safeSerialize = (value: unknown): string => {
+                            const seen = new WeakSet<object>();
+
+                            try {
+                                return JSON.stringify(value, (_key, nestedValue) => {
+                                    if (nestedValue instanceof MessagePort) {
+                                        return '[MessagePort]';
+                                    }
+
+                                    if (typeof nestedValue === 'function') {
+                                        return `[Function ${nestedValue.name || 'anonymous'}]`;
+                                    }
+
+                                    if (nestedValue && typeof nestedValue === 'object') {
+                                        if (seen.has(nestedValue)) {
+                                            return '[Circular]';
+                                        }
+
+                                        seen.add(nestedValue);
+                                    }
+
+                                    return nestedValue;
+                                }) ?? '';
+                            } catch {
+                                return '';
+                            }
+                        };
+
+                        const captureDomSnapshot = (kind: 'dom' | 'dom-html') => {
+                            const body = document.body;
+                            if (!body) {
+                                return;
+                            }
+
+                            const contentType = kind === 'dom-html' ? 'text/html' : 'text/plain';
+                            const bodyContent = kind === 'dom-html'
+                                ? body.innerHTML
+                                : (body.innerText || body.textContent || '');
+
+                            if (!bodyContent || !shouldTrack(location.href, bodyContent, contentType)) {
+                                return;
+                            }
+
+                            pushEntry({
+                                kind,
+                                url: location.href,
+                                contentType,
+                                body: bodyContent,
+                                status: 200,
+                                timestamp: Date.now(),
+                            });
+                        };
+
+                        const isTextLike = (contentType: string): boolean => {
+                            const normalized = contentType.split(';')[0].trim().toLowerCase();
+                            return normalized.startsWith('text/')
+                                || normalized.includes('json')
+                                || normalized.includes('xml')
+                                || normalized.includes('javascript')
+                                || normalized.includes('svg');
+                        };
+
+                        const originalFetch = globalObject.__bonsaiOpenAIResearchProbeFetch ?? window.fetch.bind(window);
+                        globalObject.__bonsaiOpenAIResearchProbeFetch = originalFetch;
+
+                        window.fetch = async (...args) => {
+                            const response = await originalFetch(...args);
+
+                            try {
+                                const requestUrl = (() => {
+                                    const [input] = args;
+                                    if (typeof input === 'string') return input;
+                                    if (input instanceof URL) return input.href;
+                                    if (input instanceof Request) return input.url;
+                                    return '';
+                                })();
+                                const resolvedUrl = response.url || requestUrl || location.href;
+                                const contentType = response.headers.get('content-type') ?? '';
+
+                                if (shouldTrack(resolvedUrl, '', contentType) || /connector_openai_deep_research|ecosystem\/widget/i.test(resolvedUrl)) {
+                                    const clone = response.clone();
+                                    const body = isTextLike(contentType) ? await clone.text() : '';
+                                    if (body && shouldTrack(resolvedUrl, body, contentType)) {
+                                        pushEntry({
+                                            kind: 'fetch',
+                                            url: resolvedUrl,
+                                            contentType,
+                                            body,
+                                            status: response.status,
+                                            timestamp: Date.now(),
+                                        });
+                                    }
+                                }
+                            } catch {
+                                // Ignore probe failures.
+                            }
+
+                            return response;
+                        };
+
+                        const originalWindowPostMessage = globalObject.__bonsaiOpenAIResearchProbeWindowPostMessage ?? window.postMessage.bind(window);
+                        globalObject.__bonsaiOpenAIResearchProbeWindowPostMessage = originalWindowPostMessage;
+
+                        window.postMessage = ((message: unknown, targetOrigin: string, transfer?: Transferable[] | StructuredSerializeOptions) => {
+                            try {
+                                const body = typeof message === 'string' ? message : safeSerialize(message);
+                                if (body && shouldTrack(targetOrigin || location.href, body, 'window-post-message')) {
+                                    pushEntry({
+                                        kind: 'window-post-message',
+                                        url: targetOrigin || location.href,
+                                        contentType: 'application/json',
+                                        body,
+                                        status: 200,
+                                        timestamp: Date.now(),
+                                    });
+                                }
+                            } catch {
+                                // Ignore probe failures.
+                            }
+
+                            return (originalWindowPostMessage as typeof window.postMessage)(message as never, targetOrigin, transfer as never);
+                        }) as typeof window.postMessage;
+
+                        const originalPortPostMessage = globalObject.__bonsaiOpenAIResearchProbePortPostMessage ?? MessagePort.prototype.postMessage;
+                        globalObject.__bonsaiOpenAIResearchProbePortPostMessage = originalPortPostMessage;
+
+                        const wrappedPortPostMessage = function(
+                            this: MessagePort,
+                            message: unknown,
+                            transferOrOptions?: Transferable[] | StructuredSerializeOptions
+                        ) {
+                            try {
+                                const body = typeof message === 'string' ? message : safeSerialize(message);
+                                if (body && shouldTrack(location.href, body, 'message-port')) {
+                                    pushEntry({
+                                        kind: 'message-port',
+                                        url: location.href,
+                                        contentType: 'application/json',
+                                        body,
+                                        status: 200,
+                                        timestamp: Date.now(),
+                                    });
+                                }
+                            } catch {
+                                // Ignore probe failures.
+                            }
+
+                            return (originalPortPostMessage as typeof MessagePort.prototype.postMessage).call(this, message as never, transferOrOptions as never);
+                        } as typeof MessagePort.prototype.postMessage;
+
+                        MessagePort.prototype.postMessage = wrappedPortPostMessage;
+
+                        const originalOpen = globalObject.__bonsaiOpenAIResearchProbeXHROpen ?? XMLHttpRequest.prototype.open;
+                        const originalSend = globalObject.__bonsaiOpenAIResearchProbeXHRSend ?? XMLHttpRequest.prototype.send;
+                        globalObject.__bonsaiOpenAIResearchProbeXHROpen = originalOpen;
+                        globalObject.__bonsaiOpenAIResearchProbeXHRSend = originalSend;
+
+                        XMLHttpRequest.prototype.open = function(method: string, url: string | URL, ...rest: unknown[]) {
+                            (this as XMLHttpRequest & { __bonsaiProbeUrl?: string }).__bonsaiProbeUrl = String(url);
+                            return (originalOpen as (...args: unknown[]) => void).call(this, method, url, ...rest);
+                        };
+
+                        XMLHttpRequest.prototype.send = function(...args: unknown[]) {
+                            this.addEventListener('loadend', () => {
+                                try {
+                                    const probeUrl = (this as XMLHttpRequest & { __bonsaiProbeUrl?: string }).__bonsaiProbeUrl || this.responseURL || '';
+                                    const contentType = this.getResponseHeader('content-type') || '';
+                                    const body = typeof this.responseText === 'string' ? this.responseText : '';
+                                    if (probeUrl && body && shouldTrack(probeUrl, body, contentType)) {
+                                        pushEntry({
+                                            kind: 'xhr',
+                                            url: probeUrl,
+                                            contentType,
+                                            body,
+                                            status: this.status,
+                                            timestamp: Date.now(),
+                                        });
+                                    }
+                                } catch {
+                                    // Ignore probe failures.
+                                }
+                            }, { once: true });
+
+                            return originalSend.call(this, ...(args as []));
+                        };
+
+                        window.addEventListener('message', (event) => {
+                            try {
+                                const body = typeof event.data === 'string'
+                                    ? event.data
+                                    : JSON.stringify(event.data);
+                                if (!body || !shouldTrack(event.origin || location.href, body, 'message')) {
+                                    return;
+                                }
+
+                                pushEntry({
+                                    kind: 'message',
+                                    url: event.origin || location.href,
+                                    contentType: 'application/json',
+                                    body,
+                                    status: 200,
+                                    timestamp: Date.now(),
+                                });
+                            } catch {
+                                // Ignore unserializable payloads.
+                            }
+                        }, true);
+
+                        if (document.readyState === 'loading') {
+                            document.addEventListener('DOMContentLoaded', () => {
+                                captureDomSnapshot('dom');
+                                captureDomSnapshot('dom-html');
+                            }, { once: true });
+                        } else {
+                            captureDomSnapshot('dom');
+                            captureDomSnapshot('dom-html');
+                        }
+
+                        window.setTimeout(() => {
+                            captureDomSnapshot('dom');
+                            captureDomSnapshot('dom-html');
+                        }, 2000);
+                    },
+                });
+
+                sendResponse({ success: true });
+            } catch (error) {
+                sendResponse({ success: false, error: String(error) });
+            }
+        })();
+        return true;
+    }
+
+    if (message.type === 'GET_OPENAI_RESEARCH_PROBE_DATA') {
+        (async () => {
+            if (!sender.tab?.id) {
+                sendResponse({ snapshots: [], error: 'Missing sender tab id' });
+                return;
+            }
+
+            try {
+                const results = await chrome.scripting.executeScript({
+                    target: {
+                        tabId: sender.tab.id,
+                        allFrames: true,
+                    },
+                    world: 'MAIN',
+                    func: () => {
+                        const globalObject = window as Window & {
+                            __bonsaiOpenAIResearchProbe?: {
+                                entries: Array<{
+                                    kind: string;
+                                    url: string;
+                                    contentType?: string;
+                                    body: string;
+                                    timestamp: number;
+                                    status?: number;
+                                }>;
+                            };
+                        };
+
+                        return {
+                            url: location.href,
+                            title: document.title ?? '',
+                            isTop: window.top === window,
+                            bodyText: document.body?.innerText ?? document.body?.textContent ?? '',
+                            bodyHtml: document.body?.innerHTML ?? '',
+                            entries: globalObject.__bonsaiOpenAIResearchProbe?.entries ?? [],
+                        };
+                    },
+                });
+
+                sendResponse({
+                    snapshots: results
+                        .map((result) => ({
+                            frameId: result.frameId,
+                            ...(result.result ?? {
+                                url: '',
+                                title: '',
+                                isTop: false,
+                                bodyText: '',
+                                bodyHtml: '',
+                                entries: [],
+                            }),
+                        }))
+                        .filter((snapshot) => typeof snapshot.url === 'string'),
+                });
+            } catch (error) {
+                sendResponse({ snapshots: [], error: String(error) });
+            }
+        })();
+        return true;
+    }
+
     if (message.type === 'UPDATE_CONFIG') {
         const { host, apiKey } = message.payload;
         chrome.storage.local.set({

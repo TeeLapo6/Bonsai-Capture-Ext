@@ -24,6 +24,9 @@ function formatContentBlock(block: ContentBlock): string {
         case 'markdown':
             return block.value;
 
+        case 'html':
+            return block.value;
+
         case 'code':
             return `\`\`\`${block.language}\n${block.value}\n\`\`\``;
 
@@ -64,29 +67,39 @@ function formatMessage(message: MessageNode, artifacts: ArtifactNode[] = []): st
         .filter(Boolean)
         .join('\n\n');
 
-    // Blockquote the content
-    md += content.split('\n').map(line => `> ${line}`).join('\n');
+    if (content) {
+        md += `${content}\n\n`;
+    }
 
     // Inline Artifacts
     const renderedArtifacts = new Set<string>();
     if (artifacts.length > 0) {
-        md += '\n>\n'; // Spacing within blockquote
         for (const artifact of artifacts) {
             if (renderedArtifacts.has(artifact.artifact_id)) continue;
             renderedArtifacts.add(artifact.artifact_id);
 
-            md += `> **${artifact.title || artifact.type}**\n>\n`;
+            md += `**${artifact.title || artifact.type}**\n\n`;
+            const artifactLinks: string[] = [];
+            if (artifact.view_url) {
+                artifactLinks.push(`[Open](${artifact.view_url})`);
+            }
+            if (artifact.source_url && artifact.source_url !== artifact.view_url) {
+                artifactLinks.push(`[Source](${artifact.source_url})`);
+            }
+            if (artifactLinks.length > 0) {
+                md += `*Links: ${artifactLinks.join(' | ')}*\n\n`;
+            }
             if (artifact.type === 'image' && typeof artifact.content === 'string') {
-                md += `> ![${artifact.title ?? 'image'}](${artifact.content})\n>\n`;
+                md += `![${artifact.title ?? 'image'}](${artifact.content})\n\n`;
+            } else if (artifact.type === 'file' && typeof artifact.content === 'string' && artifact.content.startsWith('data:')) {
+                md += `[Captured file included in HTML export: ${artifact.title ?? 'file'}]\n\n`;
             } else if (artifact.type === 'code_artifact' && typeof artifact.content === 'string') {
-                md += `> \`\`\`\n> ${artifact.content.replace(/\n/g, '\n> ')}\n> \`\`\`\n>\n`;
+                md += `\`\`\`\n${artifact.content}\n\`\`\`\n\n`;
             } else {
-                md += `> [Artifact: ${artifact.type}]\n>\n`;
+                md += `[Artifact: ${artifact.type}]\n\n`;
             }
         }
     }
-
-    md += '\n\n';
 
     // Add timestamp if present
     if (message.created_at) {
@@ -104,16 +117,21 @@ export function exportToMarkdown(graph: ConversationGraph): string {
     // Header
     md += `# ${graph.title ?? 'Conversation'}\n\n`;
     md += `**Captured from:** ${graph.source.provider_site}\n\n`;
-    md += `**Source URL:** [${graph.source.url}](${graph.source.url})\n\n`;
-    md += `**Captured at:** ${graph.source.captured_at}\n\n`;
+    if (graph.source.url) {
+        md += `**Source URL:** [${graph.source.url}](${graph.source.url})\n\n`;
+    }
+    if (graph.source.captured_at) {
+        md += `**Captured at:** ${graph.source.captured_at}\n\n`;
+    }
 
     // Provenance
     if (graph.provenance.provider || graph.provenance.model) {
         md += `**Provider:** ${graph.provenance.provider ?? 'unknown'}`;
         if (graph.provenance.model) {
             md += ` (${graph.provenance.model})`;
+            md += ` [${graph.provenance.confidence}]`;
         }
-        md += ` [${graph.provenance.confidence}]\n\n`;
+        md += `\n\n`;
     }
 
     md += '---\n\n';
@@ -138,9 +156,22 @@ export function exportToMarkdown(graph: ConversationGraph): string {
             md += `### ${artifact.title ?? artifact.type}\n\n`;
             md += `**Type:** ${artifact.type}\n\n`;
 
+            const artifactLinks: string[] = [];
+            if (artifact.view_url) {
+                artifactLinks.push(`[Open](${artifact.view_url})`);
+            }
+            if (artifact.source_url && artifact.source_url !== artifact.view_url) {
+                artifactLinks.push(`[Source](${artifact.source_url})`);
+            }
+            if (artifactLinks.length > 0) {
+                md += `**Links:** ${artifactLinks.join(' | ')}\n\n`;
+            }
+
             if (typeof artifact.content === 'string') {
                 if (artifact.type === 'image') {
                     md += `![${artifact.title ?? 'artifact'}](${artifact.content})\n\n`;
+                } else if (artifact.type === 'file' && artifact.content.startsWith('data:')) {
+                    md += `[Captured file included in HTML export: ${artifact.title ?? 'file'}]\n\n`;
                 } else if (artifact.type === 'code_artifact') {
                     md += `\`\`\`\n${artifact.content}\n\`\`\`\n\n`;
                 } else {

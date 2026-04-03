@@ -8,6 +8,7 @@ const extensionPath = process.env.CAPTURE_EXTENSION_PATH || path.resolve(__dirna
 
 export default defineConfig({
   testDir: './tests/harness',
+  testMatch: '**/*.spec.ts',
   timeout: 90000,
   retries: 0,
   reporter: [['list']],

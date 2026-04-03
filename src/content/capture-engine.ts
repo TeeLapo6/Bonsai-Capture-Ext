@@ -4,8 +4,9 @@
  * Orchestrates conversation capture using the appropriate provider adapter.
  */
 
+import { ProviderRegistry } from './adapters/factory';
 import type { ProviderAdapter } from './adapters/interface';
-import type { ConversationGraph, CaptureScope, MessageNode } from '../shared/schema';
+import type { ConversationGraph, CaptureScope, MessageNode, ArtifactNode } from '../shared/schema';
 
 export class CaptureEngine {
     private _adapter: ProviderAdapter | null = null;
@@ -16,7 +17,7 @@ export class CaptureEngine {
      */
     private get adapter(): ProviderAdapter | null {
         if (!this._initialized) {
-            this._adapter = (window as any).__bonsaiAdapter ?? null;
+            this._adapter = (window as any).__bonsaiAdapter ?? ProviderRegistry.getAdapter(window.location.hostname);
             this._initialized = true;
         }
         return this._adapter;
@@ -75,6 +76,8 @@ export class CaptureEngine {
                 return this.captureSingleMessage(scope.message_id);
             case 'up_to_message':
                 return this.captureUpToMessage(scope.message_id);
+            case 'from_message':
+                return this.captureFromMessage(scope.message_id);
             case 'artifacts_only':
                 return this.captureArtifactsOnly(scope.artifact_ids);
             default:
@@ -89,20 +92,98 @@ export class CaptureEngine {
         return (await this.adapter?.captureConversation()) ?? null;
     }
 
+    private async captureGeminiSingleMessage(messageId: string): Promise<ConversationGraph | null> {
+        if (!this.adapter) {
+            return null;
+        }
+
+        const conversation = this.adapter.detectConversation();
+        if (!conversation) {
+            return null;
+        }
+
+        const elements = this.adapter.listMessages();
+        const numericIndex = Number(messageId);
+        let selectedIndex = -1;
+        let selectedElement: Element | null = null;
+        let selectedMessage: MessageNode | null = null;
+
+        if (!Number.isNaN(numericIndex) && numericIndex >= 0 && numericIndex < elements.length) {
+            selectedIndex = numericIndex;
+            selectedElement = elements[selectedIndex];
+            selectedMessage = await this.adapter.parseMessage(selectedElement, selectedIndex);
+        } else {
+            for (const [index, element] of elements.entries()) {
+                const parsed = await this.adapter.parseMessage(element, index);
+                if (parsed.message_id === messageId) {
+                    selectedIndex = index;
+                    selectedElement = element;
+                    selectedMessage = parsed;
+                    break;
+                }
+            }
+        }
+
+        if (!selectedElement || !selectedMessage) {
+            return null;
+        }
+
+        const artifacts = await this.adapter.parseArtifacts(selectedElement);
+        selectedMessage.artifact_ids = [];
+
+        const scopedArtifacts: ArtifactNode[] = artifacts.map((artifact) => {
+            selectedMessage!.artifact_ids.push(artifact.artifact_id);
+
+            return {
+                ...artifact,
+                source_message_id: selectedMessage!.message_id,
+            };
+        });
+
+        return {
+            conversation_id: crypto.randomUUID(),
+            title: conversation.title,
+            source: {
+                provider_site: this.adapter.providerSite as any,
+                url: conversation.url,
+                captured_at: new Date().toISOString(),
+                capture_version: '0.1.0',
+            },
+            provenance: this.adapter.getProvenance(),
+            messages: [selectedMessage],
+            artifacts: scopedArtifacts,
+        };
+    }
+
     /**
      * Capture a single message.
      */
     async captureSingleMessage(messageId: string): Promise<ConversationGraph | null> {
+        if (this.adapter?.providerSite === 'gemini.google.com') {
+            const scopedGeminiCapture = await this.captureGeminiSingleMessage(messageId);
+            if (scopedGeminiCapture) {
+                return scopedGeminiCapture;
+            }
+        }
+
         const full = await this.adapter?.captureConversation();
         if (!full) return null;
 
-        const message = full.messages.find(m => m.message_id === messageId);
+        let message = full.messages.find(m => m.message_id === messageId);
+
+        if (!message) {
+            const index = Number(messageId);
+            if (!Number.isNaN(index) && index >= 0 && index < full.messages.length) {
+                message = full.messages[index];
+            }
+        }
+
         if (!message) return null;
 
         return {
             ...full,
             messages: [message],
-            artifacts: full.artifacts.filter(a => message.artifact_ids.includes(a.artifact_id))
+            artifacts: full.artifacts.filter(a => message!.artifact_ids.includes(a.artifact_id))
         };
     }
 
@@ -113,7 +194,15 @@ export class CaptureEngine {
         const full = await this.adapter?.captureConversation();
         if (!full) return null;
 
-        const index = full.messages.findIndex(m => m.message_id === messageId);
+        let index = full.messages.findIndex(m => m.message_id === messageId);
+
+        if (index === -1) {
+            const numericIndex = Number(messageId);
+            if (!Number.isNaN(numericIndex) && numericIndex >= 0 && numericIndex < full.messages.length) {
+                index = numericIndex;
+            }
+        }
+
         if (index === -1) return null;
 
         const messages = full.messages.slice(0, index + 1);
@@ -139,6 +228,34 @@ export class CaptureEngine {
             ...full,
             messages: [],
             artifacts: full.artifacts.filter(a => artifactSet.has(a.artifact_id))
+        };
+    }
+
+    /**
+     * Capture this message and all following messages.
+     */
+    async captureFromMessage(messageId: string): Promise<ConversationGraph | null> {
+        const full = await this.adapter?.captureConversation();
+        if (!full) return null;
+
+        let index = full.messages.findIndex(m => m.message_id === messageId);
+
+        if (index === -1) {
+            const numericIndex = Number(messageId);
+            if (!Number.isNaN(numericIndex) && numericIndex >= 0 && numericIndex < full.messages.length) {
+                index = numericIndex;
+            }
+        }
+
+        if (index === -1) return null;
+
+        const messages = full.messages.slice(index);
+        const artifactIds = new Set(messages.flatMap(m => m.artifact_ids));
+
+        return {
+            ...full,
+            messages,
+            artifacts: full.artifacts.filter(a => artifactIds.has(a.artifact_id))
         };
     }
 

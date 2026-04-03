@@ -60,6 +60,7 @@ export const canonicalConversationGraph: ConversationGraph = {
       content: 'data:image/png;base64,ZmFrZV9pbWFnZQ==',
       source_message_id: 'msg_assistant',
       source_url: 'https://chatgpt.com/c/conv_1',
+      view_url: 'https://chatgpt.com/c/conv_1',
       exportable: true,
     },
     {
@@ -70,6 +71,7 @@ export const canonicalConversationGraph: ConversationGraph = {
       content: 'https://example.com/report.pdf',
       source_message_id: 'msg_assistant',
       source_url: 'https://example.com/report.pdf',
+      view_url: 'https://example.com/report.pdf',
       exportable: true,
     },
   ],

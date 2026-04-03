@@ -3,6 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      (function () {
+        var stored = localStorage.getItem('bonsai-capture-theme') || 'system';
+        var resolved = stored === 'system'
+          ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+          : stored;
+        document.documentElement.dataset.theme = resolved;
+        document.documentElement.dataset.themePreference = stored;
+      })();
+    </script>
     <title>Bonsai Capture</title>
     <link rel="stylesheet" href="src/ui/styles.css" />
   </head>

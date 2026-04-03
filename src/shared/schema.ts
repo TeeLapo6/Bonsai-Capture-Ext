@@ -40,6 +40,11 @@ export interface MarkdownBlock {
     value: string;
 }
 
+export interface HtmlBlock {
+    type: 'html';
+    value: string;
+}
+
 export interface TextBlock {
     type: 'text';
     value: string;
@@ -70,6 +75,7 @@ export interface ListBlock {
 
 export type ContentBlock =
     | MarkdownBlock
+    | HtmlBlock
     | TextBlock
     | CodeBlock
     | ImageRefBlock
@@ -125,6 +131,7 @@ export interface ArtifactNode {
     content: string | Record<string, unknown>;
     source_message_id: string;
     source_url?: string;
+    view_url?: string;
     exportable: boolean;
 }
 
@@ -146,6 +153,7 @@ export interface ConversationGraph {
     provenance: Provenance;
     messages: MessageNode[];
     artifacts: ArtifactNode[];
+    tags?: string[];
 }
 
 // =============================================================================
@@ -155,6 +163,7 @@ export interface ConversationGraph {
 export type CaptureScope =
     | { type: 'single_message'; message_id: string }
     | { type: 'up_to_message'; message_id: string }
+    | { type: 'from_message'; message_id: string }
     | { type: 'entire_conversation' }
     | { type: 'artifacts_only'; artifact_ids: string[] };
 
@@ -204,4 +213,8 @@ export function createCodeBlock(value: string, language: string = ''): CodeBlock
 
 export function createMarkdownBlock(value: string): MarkdownBlock {
     return { type: 'markdown', value };
+}
+
+export function createHtmlBlock(value: string): HtmlBlock {
+    return { type: 'html', value };
 }

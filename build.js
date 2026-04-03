@@ -7,11 +7,14 @@ const __dirname = dirname(__filename);
 
 // Content scripts to build
 const ADAPTERS = {
+    'content/chatgpt_probe': 'src/content/chatgpt_probe.ts',
     'content/chatgpt': 'src/content/adapters/chatgpt.ts',
     'content/claude': 'src/content/adapters/claude.ts',
     'content/gemini': 'src/content/adapters/gemini.ts',
     'content/grok': 'src/content/adapters/grok.ts',
-    'content/bonsai_webui': 'src/content/adapters/bonsai_webui.ts'
+    'content/bonsai_webui': 'src/content/adapters/bonsai_webui.ts',
+    // Jules is a recent provider; make sure we build its content script
+    'content/jules': 'src/content/adapters/jules.ts'
 };
 
 async function buildAll() {

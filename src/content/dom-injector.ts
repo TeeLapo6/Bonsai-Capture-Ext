@@ -6,53 +6,92 @@
  */
 
 import { getSelectorsForSite, queryAllWithFallbacks } from '../config/selectors';
+import { ProviderRegistry } from './adapters/factory';
+
+type InsertMode = 'single' | 'upto' | 'from';
+
+const INSERT_MODE_LABELS: Record<InsertMode, string> = {
+    single: 'This Message',
+    upto: 'Up to Message',
+    from: 'This + Following',
+};
 
 // Button styles injected as a style element
 const BUTTON_STYLES = `
 .bonsai-insert-btn {
     display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 4px 8px;
+    align-items: stretch;
+    padding: 0;
     margin-left: 8px;
-    font-size: 12px;
-    font-weight: 500;
-    color: #10b981;
-    background: rgba(16, 185, 129, 0.1);
-    border: 1px solid rgba(16, 185, 129, 0.3);
-    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 700;
+    color: #082f3f;
+    background: linear-gradient(90deg, #59e0b3 0%, #5bdfb4 14%, #5fddb8 28%, #63d9bf 42%, #67d3cb 56%, #68ccd9 70%, #67c4e7 84%, #62b5f7 100%);
+    border: 1px solid rgba(96, 206, 176, 0.52);
+    border-radius: 999px;
+    overflow: hidden;
     cursor: pointer;
     transition: all 0.15s ease;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     z-index: 10;
+    box-shadow: 0 10px 22px rgba(21, 104, 90, 0.18);
 }
 
 .bonsai-insert-btn:hover {
-    background: rgba(16, 185, 129, 0.2);
-    border-color: rgba(16, 185, 129, 0.5);
     transform: translateY(-1px);
+    box-shadow: 0 12px 24px rgba(21, 104, 90, 0.24);
 }
 
 .bonsai-insert-btn:active {
     transform: translateY(0);
 }
 
-.bonsai-insert-btn svg {
-    width: 14px;
-    height: 14px;
+.bonsai-insert-label,
+.bonsai-insert-mode {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    white-space: nowrap;
+}
+
+.bonsai-insert-label {
+    padding: 6px 10px 6px 12px;
+    color: #0a3a2c;
+    background: linear-gradient(90deg, rgba(89, 224, 179, 0.22), rgba(98, 214, 186, 0.18));
+}
+
+.bonsai-insert-mode {
+    padding: 6px 12px 6px 10px;
+    color: #083652;
+    background: linear-gradient(90deg, rgba(104, 204, 217, 0.16), rgba(98, 181, 247, 0.22));
+    border-left: 1px solid rgba(255, 255, 255, 0.22);
+}
+
+.bonsai-insert-btn.is-inserted .bonsai-insert-label {
+    color: #0d3a2d;
 }
 `;
-
-// SVG icon for the button
-const INSERT_ICON = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-  <path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-</svg>`;
 
 export class DOMInjector {
     private observer: MutationObserver | null = null;
     private styleEl: HTMLStyleElement | null = null;
     private hostname: string;
     private injectedMessages = new WeakSet<Element>();
+    private insertMode: InsertMode = 'upto';
+    private readonly handleStorageChange = (
+        changes: Record<string, chrome.storage.StorageChange>,
+        areaName: string
+    ) => {
+        if (areaName !== 'local' || !changes.insertMode) {
+            return;
+        }
+
+        const nextMode = changes.insertMode.newValue;
+        if (this.isInsertMode(nextMode)) {
+            this.insertMode = nextMode;
+            this.refreshButtonMarkup();
+        }
+    };
 
     constructor() {
         this.hostname = window.location.hostname.replace(/^www\./, '');
@@ -65,8 +104,18 @@ export class DOMInjector {
         // Inject styles
         this.injectStyles();
 
-        // Initial injection
-        this.injectButtons();
+        if (!chrome.storage.onChanged.hasListener(this.handleStorageChange)) {
+            chrome.storage.onChanged.addListener(this.handleStorageChange);
+        }
+
+        chrome.storage.local.get(['insertMode'], (result) => {
+            if (this.isInsertMode(result.insertMode)) {
+                this.insertMode = result.insertMode;
+            }
+
+            this.injectButtons();
+            this.refreshButtonMarkup();
+        });
 
         // Observe for new messages
         this.startObserver();
@@ -88,6 +137,10 @@ export class DOMInjector {
             this.styleEl = null;
         }
 
+        if (chrome.storage.onChanged.hasListener(this.handleStorageChange)) {
+            chrome.storage.onChanged.removeListener(this.handleStorageChange);
+        }
+
         // Remove all injected buttons
         document.querySelectorAll('.bonsai-insert-btn').forEach(btn => btn.remove());
         document.querySelectorAll('.bonsai-action-container').forEach(c => c.remove());
@@ -107,6 +160,25 @@ export class DOMInjector {
         document.head.appendChild(this.styleEl);
     }
 
+    private isInsertMode(value: unknown): value is InsertMode {
+        return value === 'single' || value === 'upto' || value === 'from';
+    }
+
+    private renderButtonMarkup(isInserted = false): string {
+        const insertLabel = isInserted ? 'Inserted' : 'Insert';
+        const modeLabel = INSERT_MODE_LABELS[this.insertMode];
+        return `<span class="bonsai-insert-label">${insertLabel}</span><span class="bonsai-insert-mode">${modeLabel}</span>`;
+    }
+
+    private refreshButtonMarkup(): void {
+        document.querySelectorAll<HTMLButtonElement>('.bonsai-insert-btn').forEach((button) => {
+            if (!button.classList.contains('is-inserted')) {
+                button.innerHTML = this.renderButtonMarkup();
+            }
+            button.title = `Insert ${INSERT_MODE_LABELS[this.insertMode]}`;
+        });
+    }
+
     /**
      * Inject buttons into all messages.
      */
@@ -114,7 +186,17 @@ export class DOMInjector {
         const selectors = getSelectorsForSite(this.hostname);
         if (!selectors) return;
 
-        const messages = queryAllWithFallbacks(document, selectors.messageBlock);
+        let messages: Element[] = [];
+
+        // Prefer adapter's own listMessages() if available to keep index mapping exact.
+        const adapter = (window as any).__bonsaiAdapter ?? ProviderRegistry.getAdapter(this.hostname);
+        if (adapter) {
+            messages = adapter.listMessages();
+        }
+
+        if (!messages || messages.length === 0) {
+            messages = queryAllWithFallbacks(document, selectors.messageBlock);
+        }
 
         messages.forEach((messageEl, index) => {
             if (this.injectedMessages.has(messageEl)) return;
@@ -128,6 +210,15 @@ export class DOMInjector {
      * Inject a button into a specific message element.
      */
     private injectButtonIntoMessage(messageEl: Element, index: number): void {
+
+        const stableMessageId = this.getMessageId(messageEl) ?? crypto.randomUUID();
+        if (!messageEl.hasAttribute('data-message-id') && !messageEl.hasAttribute('data-bonsai-msg-id')) {
+            try {
+                messageEl.setAttribute('data-bonsai-msg-id', stableMessageId);
+            } catch {
+                // Some provider DOM nodes may reject attribute writes; the button still works with the synthetic id.
+            }
+        }
 
         // Skip artifact containers directly if identified as message blocks (unlikely but safe)
         if (messageEl.closest('.artifact-card, .code-block, pre, [data-is-artifact="true"], [data-artifact]')) return;
@@ -146,10 +237,11 @@ export class DOMInjector {
         // Create button
         const button = document.createElement('button');
         button.className = 'bonsai-insert-btn';
-        button.innerHTML = `${INSERT_ICON}<span>Insert</span>`;
-        button.title = 'Insert to Bonsai Editor';
+        button.type = 'button';
+        button.innerHTML = this.renderButtonMarkup();
+        button.title = `Insert ${INSERT_MODE_LABELS[this.insertMode]}`;
         button.dataset.messageIndex = String(index);
-        button.dataset.messageId = this.getMessageId(messageEl) ?? String(index);
+        button.dataset.messageId = stableMessageId;
 
         // Click handler
         button.addEventListener('click', (e) => {
@@ -302,7 +394,9 @@ export class DOMInjector {
      */
     private getMessageId(messageEl: Element): string | null {
         return messageEl.getAttribute('data-message-id')
+            ?? messageEl.getAttribute('data-bonsai-msg-id')
             ?? messageEl.closest('[data-message-id]')?.getAttribute('data-message-id')
+            ?? messageEl.closest('[data-bonsai-msg-id]')?.getAttribute('data-bonsai-msg-id')
             ?? null;
     }
 
@@ -339,9 +433,11 @@ export class DOMInjector {
 
 
         if (button) {
-            button.textContent = '✓ Inserted';
+            button.classList.add('is-inserted');
+            button.innerHTML = this.renderButtonMarkup(true);
             setTimeout(() => {
-                button.innerHTML = `${INSERT_ICON}<span>Insert</span>`;
+                button.classList.remove('is-inserted');
+                button.innerHTML = this.renderButtonMarkup();
             }, 1500);
         }
 

@@ -71,6 +71,13 @@ describe('capture export contracts', () => {
         },
       ],
     });
+
+    expect(pkg.attachments[0]).toMatchObject({
+      external_id: 'artifact_image',
+      source_message_id: 'msg_assistant',
+      source_url: 'https://chatgpt.com/c/conv_1',
+      view_url: 'https://chatgpt.com/c/conv_1',
+    });
   });
 
   it('renders markdown with provider metadata and inline artifacts', () => {
@@ -80,6 +87,8 @@ describe('capture export contracts', () => {
     expect(markdown).toContain('**Captured from:** chatgpt.com');
     expect(markdown).toContain('### 🤖 Assistant');
     expect(markdown).toContain('*Model: gpt-4o*');
+    expect(markdown).not.toContain('\n> Here is the result and the supporting image.');
+    expect(markdown).toContain('[Open](https://chatgpt.com/c/conv_1)');
     expect(markdown).toContain('![preview](artifact:artifact_image)');
     expect(markdown).toContain('```json');
     expect(markdown).toContain('*Exported via Bonsai Capture*');

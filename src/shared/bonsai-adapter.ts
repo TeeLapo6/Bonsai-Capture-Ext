@@ -63,6 +63,8 @@ export interface ImportAttachment {
     mime_type?: string;
     content: string;
     source_message_id: string;
+    source_url?: string;
+    view_url?: string;
 }
 
 // =============================================================================
@@ -82,7 +84,7 @@ export function toBonsaiImportPackage(graph: ConversationGraph): BonsaiImportPac
         bonsai_version: 'v1',
         conversation: {
             title: graph.title,
-            created_at: graph.source.captured_at,
+            created_at: graph.source.captured_at || undefined,
             origin_url: graph.source.url,
             provider_site: graph.source.provider_site,
         },
@@ -200,7 +202,9 @@ function transformArtifact(artifact: ArtifactNode): ImportAttachment {
         title: artifact.title,
         mime_type: artifact.mime_type,
         content: contentStr,
-        source_message_id: artifact.source_message_id
+        source_message_id: artifact.source_message_id,
+        source_url: artifact.source_url,
+        view_url: artifact.view_url
     };
 }
 
@@ -208,6 +212,8 @@ function blockToString(block: ContentBlock): string {
     switch (block.type) {
         case 'text':
         case 'markdown':
+            return block.value;
+        case 'html':
             return block.value;
         case 'code':
             return `\`\`\`${block.language || ''}\n${block.value}\n\`\`\``;
