@@ -7,9 +7,16 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useEditor, EditorContent } from '@tiptap/react';
+import { Extension } from '@tiptap/core';
 import StarterKit from '@tiptap/starter-kit';
+import Link from '@tiptap/extension-link';
+import Superscript from '@tiptap/extension-superscript';
 import Placeholder from '@tiptap/extension-placeholder';
 import Image from '@tiptap/extension-image';
+import Table from '@tiptap/extension-table';
+import TableRow from '@tiptap/extension-table-row';
+import TableHeader from '@tiptap/extension-table-header';
+import TableCell from '@tiptap/extension-table-cell';
 import type { ConversationGraph } from '../shared/schema';
 import { exportToMarkdown } from '../shared/exporters/markdown';
 import { exportToJSON } from '../shared/exporters/json';
@@ -17,10 +24,82 @@ import { exportToJSON } from '../shared/exporters/json';
 import { exportToTOONString } from '../shared/exporters/toon';
 import { toBonsaiImportPackage } from '../shared/bonsai-adapter';
 import { markdownToHtml } from '../shared/markdown-to-html';
+import { renderConversationGraphToHtml } from '../shared/render-preview-html';
+import bonsaiLogo from '../../../Bonsai-WebUI/src/components/icons/bonsai.png';
 
 import JSZip from 'jszip';
 
 type TabType = 'capture' | 'history' | 'export' | 'settings' | 'bulk';
+type ThemePreference = 'light' | 'dark' | 'system';
+
+const THEME_STORAGE_KEY = 'bonsai-capture-theme';
+const THEME_OPTIONS: ThemePreference[] = ['light', 'dark', 'system'];
+const THEME_LABELS: Record<ThemePreference, string> = {
+    light: 'Light',
+    dark: 'Dark',
+    system: 'System',
+};
+
+const THEME_ICONS: Record<ThemePreference, string> = {
+    light: '☀️',
+    dark: '🌙',
+    system: '🖥️',
+};
+
+function resolveThemePreference(theme: ThemePreference): 'light' | 'dark' {
+    if (theme === 'system') {
+        return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+
+    return theme;
+}
+
+function applyThemePreference(theme: ThemePreference) {
+    const resolvedTheme = resolveThemePreference(theme);
+    document.documentElement.dataset.theme = resolvedTheme;
+    document.documentElement.dataset.themePreference = theme;
+}
+
+const BonsaiAnchorAttributes = Extension.create({
+    name: 'bonsaiAnchorAttributes',
+
+    addGlobalAttributes() {
+        return [
+            {
+                types: ['heading', 'paragraph', 'listItem'],
+                attributes: {
+                    id: {
+                        default: null,
+                        parseHTML: (element) => element.getAttribute('id'),
+                        renderHTML: (attributes) => attributes.id ? { id: attributes.id } : {},
+                    },
+                    'data-artifact-id': {
+                        default: null,
+                        parseHTML: (element) => element.getAttribute('data-artifact-id'),
+                        renderHTML: (attributes) => attributes['data-artifact-id'] ? { 'data-artifact-id': attributes['data-artifact-id'] } : {},
+                    },
+                    'data-bonsai-source-index': {
+                        default: null,
+                        parseHTML: (element) => element.getAttribute('data-bonsai-source-index'),
+                        renderHTML: (attributes) => attributes['data-bonsai-source-index'] ? { 'data-bonsai-source-index': attributes['data-bonsai-source-index'] } : {},
+                    },
+                },
+            },
+        ];
+    },
+});
+
+interface CaptureMetadataOptions {
+    includeTimestamps: boolean;
+    includeModels: boolean;
+    includeAnchors: boolean;
+}
+
+const DEFAULT_CAPTURE_METADATA_OPTIONS: CaptureMetadataOptions = {
+    includeTimestamps: true,
+    includeModels: true,
+    includeAnchors: true
+};
 
 interface CapturedItem {
     id: string;
@@ -48,6 +127,33 @@ interface Diagnostics {
     provenance: { provider?: string; model?: string; confidence: string } | null;
 }
 
+
+function getTextNodesIn(el: Element): Text[] {
+    const nodes: Text[] = [];
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let node: Node | null;
+    while ((node = walker.nextNode())) {
+        nodes.push(node as Text);
+    }
+    return nodes;
+}
+
+function findTextMatches(
+    textNodes: Text[],
+    query: string
+): Array<{ node: Text; start: number; end: number }> {
+    const matches: Array<{ node: Text; start: number; end: number }> = [];
+    const lowerQuery = query.toLowerCase();
+    for (const textNode of textNodes) {
+        const data = textNode.data.toLowerCase();
+        let pos = 0;
+        while ((pos = data.indexOf(lowerQuery, pos)) !== -1) {
+            matches.push({ node: textNode, start: pos, end: pos + query.length });
+            pos++;
+        }
+    }
+    return matches;
+}
 
 // Sub-component for Batch History Items to avoid Hook-in-Loop errors
 const HistoryBatchItem = ({
@@ -177,10 +283,40 @@ export function SidePanel() {
     const [exportBatch, setExportBatch] = useState<CapturedItem[] | null>(null);
     const [isImporting, setIsImporting] = useState(false);
     const [importProgress, setImportProgress] = useState(0);
+    const [searchTerm, setSearchTerm] = useState('');
+    const [captureSearchQuery, setCaptureSearchQuery] = useState('');
+    const [captureSearchMiss, setCaptureSearchMiss] = useState(false);
+    const [themePreference, setThemePreference] = useState<ThemePreference>(() => {
+        if (typeof window === 'undefined') {
+            return 'system';
+        }
+
+        const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+        return stored === 'light' || stored === 'dark' || stored === 'system' ? stored : 'system';
+    });
+    const [captureMetadataOptions, setCaptureMetadataOptions] = useState<CaptureMetadataOptions>(DEFAULT_CAPTURE_METADATA_OPTIONS);
+    const captureSearchInputRef = useRef<HTMLInputElement | null>(null);
+    const lastCaptureSearchQueryRef = useRef('');
+    const [findStats, setFindStats] = useState<{ current: number; total: number } | null>(null);
+    const findMatchesRef = useRef<Array<{ node: Text; start: number; end: number }>>([]);
+    const findCurrentIndexRef = useRef(-1);
 
     const editor = useEditor({
         extensions: [
             StarterKit,
+            BonsaiAnchorAttributes,
+            Link.configure({
+                openOnClick: false,
+                autolink: false,
+                linkOnPaste: true,
+            }),
+            Superscript,
+            Table.configure({
+                resizable: false,
+            }),
+            TableRow,
+            TableHeader,
+            TableCell,
             Image.configure({
                 inline: true,
                 allowBase64: true,
@@ -192,20 +328,50 @@ export function SidePanel() {
         content: '',
     });
 
-    // Lightbox image click handler (Delegation)
+    // Lightbox image and link click handler (Delegation)
     useEffect(() => {
-        const handleImageClick = (e: MouseEvent) => {
+        const handlePanelClick = (e: MouseEvent) => {
             const target = e.target as HTMLElement;
             if (target.tagName === 'IMG' && target.closest('.editor')) {
                 const img = target as HTMLImageElement;
                 setLightboxImage(img.src);
+                return;
+            }
+
+            const anchor = target.closest('.editor a[href]') as HTMLAnchorElement | null;
+            if (!anchor) {
+                return;
+            }
+
+            const rawHref = anchor.getAttribute('href') ?? '';
+            if (!rawHref) {
+                return;
+            }
+
+            if (rawHref.startsWith('#')) {
+                e.preventDefault();
+
+                const targetId = rawHref.slice(1);
+                const editorRoot = anchor.closest('.ProseMirror') ?? document.querySelector('.editor .ProseMirror');
+                const escapedId = typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+                    ? CSS.escape(targetId)
+                    : targetId.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+                const destination = editorRoot?.querySelector<HTMLElement>(`#${escapedId}`);
+
+                destination?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+                return;
+            }
+
+            if (/^(https?:|mailto:)/i.test(rawHref)) {
+                e.preventDefault();
+                window.open(anchor.href, '_blank', 'noopener,noreferrer');
             }
         };
 
         const root = document.querySelector('.panel-content');
-        if (root) root.addEventListener('click', handleImageClick as any);
+        if (root) root.addEventListener('click', handlePanelClick as any);
         return () => {
-            if (root) root.removeEventListener('click', handleImageClick as any);
+            if (root) root.removeEventListener('click', handlePanelClick as any);
         };
     }, []);
 
@@ -216,26 +382,217 @@ export function SidePanel() {
             timestamp: new Date().toISOString(),
             data,
             source: url,
-            tags,
+            tags: tags || [],
             batchId
         };
         setCaptures(prev => {
-            // Increased limit to 500 to support large bulk captures
             const newCaptures = [newCapture, ...prev].slice(0, 500);
             chrome.storage.local.set({ captures: newCaptures });
             return newCaptures;
         });
     }, []);
 
+    const applyCaptureMetadataOptions = useCallback((graph: ConversationGraph): ConversationGraph => {
+        const includeTimestamps = captureMetadataOptions.includeTimestamps;
+        const includeModels = captureMetadataOptions.includeModels;
+        const includeAnchors = captureMetadataOptions.includeAnchors;
+
+        return {
+            ...graph,
+            messages: graph.messages.map((message) => ({
+                ...message,
+                created_at: includeTimestamps ? message.created_at : undefined,
+                origin: includeModels
+                    ? message.origin
+                    : {
+                        ...message.origin,
+                        model: undefined,
+                        confidence: 'unknown'
+                    },
+                deep_link: includeAnchors
+                    ? message.deep_link
+                    : {
+                        ...message.deep_link,
+                        message_anchor: undefined,
+                        selector_hint: undefined
+                    }
+            })),
+            artifacts: graph.artifacts.map((artifact) => ({ ...artifact }))
+        };
+    }, [captureMetadataOptions]);
+
+    const loadCaptureIntoEditor = useCallback((graph: ConversationGraph) => {
+        setCurrentCapture(graph);
+
+        if (editor) {
+            const html = renderConversationGraphToHtml(graph);
+            editor.commands.setContent(html);
+        }
+    }, [editor]);
+
+    const handleCaptureFind = useCallback((direction: 'forward' | 'backward' = 'forward') => {
+        const query = captureSearchQuery.trim();
+        if (!query) {
+            setCaptureSearchMiss(false);
+            setFindStats(null);
+            findMatchesRef.current = [];
+            findCurrentIndexRef.current = -1;
+            return;
+        }
+
+        // Switch to capture tab first, then retry after DOM settles
+        if (activeTab !== 'capture') {
+            setActiveTab('capture');
+            requestAnimationFrame(() => requestAnimationFrame(() => handleCaptureFind(direction)));
+            return;
+        }
+
+        const editorRoot = document.querySelector<Element>('.editor .ProseMirror');
+        if (!editorRoot) {
+            setCaptureSearchMiss(true);
+            return;
+        }
+
+        // Recompute match list when query changes
+        const queryChanged = lastCaptureSearchQueryRef.current !== query;
+        if (queryChanged) {
+            findMatchesRef.current = findTextMatches(getTextNodesIn(editorRoot), query);
+            findCurrentIndexRef.current = -1;
+            lastCaptureSearchQueryRef.current = query;
+        }
+
+        const matches = findMatchesRef.current;
+        if (matches.length === 0) {
+            setCaptureSearchMiss(true);
+            setFindStats({ current: 0, total: 0 });
+            return;
+        }
+
+        // Advance index
+        const prev = findCurrentIndexRef.current;
+        let next: number;
+        if (prev < 0 || queryChanged) {
+            next = direction === 'backward' ? matches.length - 1 : 0;
+        } else if (direction === 'forward') {
+            next = (prev + 1) % matches.length;
+        } else {
+            next = (prev - 1 + matches.length) % matches.length;
+        }
+        findCurrentIndexRef.current = next;
+
+        setFindStats({ current: next + 1, total: matches.length });
+        setCaptureSearchMiss(false);
+
+        // Select the matched text range and scroll it into view
+        const match = matches[next];
+        try {
+            const range = document.createRange();
+            range.setStart(match.node, match.start);
+            range.setEnd(match.node, match.end);
+            const sel = window.getSelection();
+            sel?.removeAllRanges();
+            sel?.addRange(range);
+            match.node.parentElement?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        } catch {
+            // Text node may have been removed by a DOM mutation — reset for next search
+            findMatchesRef.current = [];
+            findCurrentIndexRef.current = -1;
+            lastCaptureSearchQueryRef.current = '';
+        }
+    }, [activeTab, captureSearchQuery]);
+
+    const handleCaptureSearchKeyDown = useCallback((event: React.KeyboardEvent<HTMLInputElement>) => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            handleCaptureFind(event.shiftKey ? 'backward' : 'forward');
+        }
+
+        if (event.key === 'Escape') {
+            setCaptureSearchQuery('');
+            setCaptureSearchMiss(false);
+        }
+    }, [handleCaptureFind]);
+
+    const handleAddTag = (id: string, tag: string) => {
+        if (!tag.trim()) return;
+        setCaptures(prev => {
+            const updated = prev.map(c => {
+                if (c.id === id) {
+                    const tags = c.tags || [];
+                    if (!tags.includes(tag)) return { ...c, tags: [...tags, tag] };
+                }
+                return c;
+            });
+            chrome.storage.local.set({ captures: updated });
+            return updated;
+        });
+    };
+
+    const handleRemoveTag = (id: string, tag: string) => {
+        setCaptures(prev => {
+            const updated = prev.map(c => {
+                if (c.id === id) {
+                    return { ...c, tags: (c.tags || []).filter(t => t !== tag) };
+                }
+                return c;
+            });
+            chrome.storage.local.set({ captures: updated });
+            return updated;
+        });
+    };
+
     // Load captures from storage
     useEffect(() => {
-        chrome.storage.local.get(['captures', 'insertMode', 'bonsaiHost', 'bonsaiApiKey'], (result) => {
+        chrome.storage.local.get(['captures', 'insertMode', 'bonsaiHost', 'bonsaiApiKey', 'captureMetadataOptions'], (result) => {
             setCaptures(result.captures ?? []);
             if (result.insertMode) setInsertMode(result.insertMode);
             if (result.bonsaiHost) setBonsaiHost(result.bonsaiHost);
             if (result.bonsaiApiKey) setBonsaiApiKey(result.bonsaiApiKey);
+            if (result.captureMetadataOptions) {
+                setCaptureMetadataOptions({
+                    ...DEFAULT_CAPTURE_METADATA_OPTIONS,
+                    ...result.captureMetadataOptions
+                });
+            }
         });
     }, []);
+
+    useEffect(() => {
+        chrome.storage.local.set({ captureMetadataOptions });
+    }, [captureMetadataOptions]);
+
+    useEffect(() => {
+        applyThemePreference(themePreference);
+        window.localStorage.setItem(THEME_STORAGE_KEY, themePreference);
+    }, [themePreference]);
+
+    useEffect(() => {
+        if (themePreference !== 'system') return;
+
+        const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+        const handleThemeChange = () => applyThemePreference('system');
+
+        mediaQuery.addEventListener('change', handleThemeChange);
+        return () => mediaQuery.removeEventListener('change', handleThemeChange);
+    }, [themePreference]);
+
+    useEffect(() => {
+        if (!captureSearchQuery.trim()) {
+            setCaptureSearchMiss(false);
+            setFindStats(null);
+            findMatchesRef.current = [];
+            findCurrentIndexRef.current = -1;
+            lastCaptureSearchQueryRef.current = '';
+        }
+    }, [captureSearchQuery]);
+
+    useEffect(() => {
+        lastCaptureSearchQueryRef.current = '';
+        findMatchesRef.current = [];
+        findCurrentIndexRef.current = -1;
+        setCaptureSearchMiss(false);
+        setFindStats(null);
+    }, [currentCapture?.conversation_id]);
 
     // Save insert mode when changed
     const handleSetInsertMode = (mode: 'single' | 'upto' | 'from') => {
@@ -266,6 +623,20 @@ export function SidePanel() {
         return () => clearInterval(interval);
     }, []);
 
+    // Immediately reset diagnostics when the user switches tabs so the next poll picks up the new provider
+    useEffect(() => {
+        const handleTabActivated = () => setDiagnostics(null);
+        const handleTabUpdated = (_tabId: number, changeInfo: chrome.tabs.TabChangeInfo) => {
+            if (changeInfo.status === 'complete') setDiagnostics(null);
+        };
+        chrome.tabs.onActivated.addListener(handleTabActivated);
+        chrome.tabs.onUpdated.addListener(handleTabUpdated);
+        return () => {
+            chrome.tabs.onActivated.removeListener(handleTabActivated);
+            chrome.tabs.onUpdated.removeListener(handleTabUpdated);
+        };
+    }, []);
+
     // Listen for inline button clicks (MESSAGE_SELECTED from background)
     useEffect(() => {
         const handleMessage = async (message: any) => {
@@ -282,16 +653,11 @@ export function SidePanel() {
                     });
 
                     if (response?.data) {
-                        setCurrentCapture(response.data);
-
-                        if (editor) {
-                            const markdown = exportToMarkdown(response.data);
-                            const html = markdownToHtml(markdown);
-                            editor.commands.setContent(html);
-                        }
+                        const preparedGraph = applyCaptureMetadataOptions(response.data);
+                        loadCaptureIntoEditor(preparedGraph);
 
                         // Add to history
-                        addToHistory(response.data, tab.url || '');
+                        addToHistory(preparedGraph, tab.url || '');
 
                         setActiveTab('capture');
                     }
@@ -303,10 +669,10 @@ export function SidePanel() {
 
         chrome.runtime.onMessage.addListener(handleMessage);
         return () => chrome.runtime.onMessage.removeListener(handleMessage);
-    }, [editor, insertMode, addToHistory]);
+    }, [insertMode, addToHistory, applyCaptureMetadataOptions, loadCaptureIntoEditor]);
 
-    // Send to AI
-    const handleSendToAI = useCallback(async () => {
+    // Paste captured content into the focused element on the active page
+    const handlePaste = useCallback(async () => {
         if (!editor) return;
 
         const text = editor.getText();
@@ -316,9 +682,9 @@ export function SidePanel() {
             const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
             if (!tab?.id) return;
 
-            await chrome.tabs.sendMessage(tab.id, { type: 'SEND_TO_AI', text });
+            await chrome.tabs.sendMessage(tab.id, { type: 'PASTE_TEXT', text });
         } catch (e) {
-            console.error('Failed to send to AI:', e);
+            console.error('Failed to paste:', e);
         }
     }, [editor]);
 
@@ -334,20 +700,14 @@ export function SidePanel() {
             });
 
             if (response?.data) {
-                setCurrentCapture(response.data);
-
-                if (editor) {
-                    const markdown = exportToMarkdown(response.data);
-                    const html = markdownToHtml(markdown);
-                    editor.commands.setContent(html);
-                }
-
-                addToHistory(response.data, tab.url || '');
+                const preparedGraph = applyCaptureMetadataOptions(response.data);
+                loadCaptureIntoEditor(preparedGraph);
+                addToHistory(preparedGraph, tab.url || '');
             }
         } catch (e) {
             console.error('Capture failed:', e);
         }
-    }, [editor, addToHistory]);
+    }, [addToHistory, applyCaptureMetadataOptions, loadCaptureIntoEditor]);
 
     // Export handlers
     const handleExport = useCallback((format: string) => {
@@ -444,7 +804,7 @@ export function SidePanel() {
                 const response = await chrome.tabs.sendMessage(tab.id, { type: 'CAPTURE', scope: 'entire' });
 
                 if (response && response.data) {
-                    const graph = response.data as ConversationGraph;
+                    const graph = applyCaptureMetadataOptions(response.data as ConversationGraph);
                     addToHistory(graph, item.url, ['bulk'], batchId);
                     setBulkItems(prev => prev.map(i => i.id === item.id ? { ...i, status: 'success' } : i));
                 } else {
@@ -499,6 +859,13 @@ export function SidePanel() {
             setIsBulkCapturing(false);
             isBulkCapturingRef.current = false;
         }
+    };
+
+    const handleToggleCaptureMetadataOption = (key: keyof CaptureMetadataOptions) => {
+        setCaptureMetadataOptions((prev) => ({
+            ...prev,
+            [key]: !prev[key]
+        }));
     };
 
     const handleImportToBonsai = async () => {
@@ -589,12 +956,9 @@ export function SidePanel() {
     const handleInsertToEditor = useCallback((item: CapturedItem) => {
         if (!editor) return;
 
-        setCurrentCapture(item.data);
-        const markdown = exportToMarkdown(item.data);
-        const html = markdownToHtml(markdown);
-        editor.commands.setContent(html);
+        loadCaptureIntoEditor(item.data);
         setActiveTab('capture');
-    }, [editor]);
+    }, [editor, loadCaptureIntoEditor]);
 
     const handleBulkExport = async (format: 'markdown' | 'json', items?: CapturedItem[]) => {
         // If items are passed (from History Batch Export), use them.
@@ -645,10 +1009,63 @@ export function SidePanel() {
         <div className="side-panel">
             {/* Header */}
             <header className="panel-header">
-                <h1>
-                    <span className="logo">🌿</span>
-                    Bonsai Capture
-                </h1>
+                <div className="panel-brand">
+                    <img src={bonsaiLogo} alt="Bonsai" className="panel-logo" />
+                    <div className="panel-brand-copy">
+                        <h1>Bonsai Capture</h1>
+                        <p>Capture, search, and ship conversations cleanly.</p>
+                    </div>
+                </div>
+
+                <div className="panel-toolbar">
+                    <div className={`capture-search ${captureSearchMiss ? 'miss' : ''}`}>
+                        <input
+                            ref={captureSearchInputRef}
+                            type="search"
+                            className="input capture-search-input"
+                            placeholder="Find in capture"
+                            value={captureSearchQuery}
+                            onChange={(event) => setCaptureSearchQuery(event.target.value)}
+                            onKeyDown={handleCaptureSearchKeyDown}
+                            aria-label="Find text in capture"
+                        />
+                        {findStats !== null && (
+                            <span className={`find-stat${findStats.total === 0 ? ' find-stat-miss' : ''}`}>
+                                {findStats.total === 0 ? '0/0' : `${findStats.current}/${findStats.total}`}
+                            </span>
+                        )}
+                        <button
+                            className="btn btn-ghost btn-icon"
+                            onClick={() => handleCaptureFind('backward')}
+                            title="Previous match"
+                            aria-label="Previous match"
+                        >
+                            ↑
+                        </button>
+                        <button
+                            className="btn btn-ghost btn-icon"
+                            onClick={() => handleCaptureFind('forward')}
+                            title="Next match"
+                            aria-label="Next match"
+                        >
+                            ↓
+                        </button>
+                    </div>
+
+                    <div className="theme-toggle" role="group" aria-label="Theme preference">
+                        {THEME_OPTIONS.map((option) => (
+                            <button
+                                key={option}
+                                className={`theme-toggle-option ${themePreference === option ? 'active' : ''}`}
+                                onClick={() => setThemePreference(option)}
+                                aria-pressed={themePreference === option}
+                                title={`${THEME_LABELS[option]} theme`}
+                            >
+                                {THEME_ICONS[option]}
+                            </button>
+                        ))}
+                    </div>
+                </div>
             </header>
 
             {/* Tabs */}
@@ -796,10 +1213,41 @@ export function SidePanel() {
                             <EditorContent editor={editor} className="editor" />
                         </div>
 
+                        <div className="capture-metadata-panel">
+                            <div className="capture-metadata-title">Capture Metadata</div>
+                            <label className="capture-metadata-option">
+                                <input
+                                    type="checkbox"
+                                    checked={captureMetadataOptions.includeTimestamps}
+                                    onChange={() => handleToggleCaptureMetadataOption('includeTimestamps')}
+                                />
+                                <span>Per-message timestamps</span>
+                            </label>
+                            <label className="capture-metadata-option">
+                                <input
+                                    type="checkbox"
+                                    checked={captureMetadataOptions.includeModels}
+                                    onChange={() => handleToggleCaptureMetadataOption('includeModels')}
+                                />
+                                <span>Per-message model metadata</span>
+                            </label>
+                            <label className="capture-metadata-option">
+                                <input
+                                    type="checkbox"
+                                    checked={captureMetadataOptions.includeAnchors}
+                                    onChange={() => handleToggleCaptureMetadataOption('includeAnchors')}
+                                />
+                                <span>Message jump links / deep links</span>
+                            </label>
+                            <div className="capture-metadata-hint">
+                                                Applies to inline insert, Capture All, and Bulk captures. The capture header keeps the conversation timestamp and provider.
+                            </div>
+                        </div>
+
                         {/* Actions */}
                         <div className="capture-actions">
-                            <button className="btn btn-primary btn-full" onClick={handleSendToAI}>
-                                ✨ Send to AI
+                            <button className="btn btn-primary btn-full" onClick={handlePaste}>
+                                📋 Paste
                             </button>
 
                             <div className="action-row" style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '8px', marginTop: '8px' }}>
@@ -812,14 +1260,17 @@ export function SidePanel() {
                                         className="btn btn-secondary"
                                         onClick={() => setShowCaptureMenu(!showCaptureMenu)}
                                         title="Inline Insert Behavior"
-                                        style={{ minWidth: '40px', padding: '0 8px' }}
+                                        style={{ display: 'flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap', padding: '0 10px' }}
                                     >
-                                        ⚙️ {showCaptureMenu ? '▲' : '▼'}
+                                        <span className="insert-mode-pill">
+                                            {insertMode === 'upto' ? 'up to message' : insertMode === 'single' ? 'this message only' : 'from message'}
+                                        </span>
+                                        {showCaptureMenu ? '▲' : '▼'}
                                     </button>
 
                                     {showCaptureMenu && (
-                                        <div className="capture-menu" style={{ right: 0, left: 'auto', width: '200px' }}>
-                                            <div className="menu-header" style={{ padding: '8px', fontSize: '11px', color: '#666', borderBottom: '1px solid #eee' }}>
+                                        <div className="capture-menu" style={{ right: 0, left: 'auto', width: '210px' }}>
+                                            <div className="menu-header" style={{ padding: '8px', fontSize: '11px', color: 'var(--text-secondary)', borderBottom: '1px solid var(--border-color)' }}>
                                                 INLINE INSERT BEHAVIOR
                                             </div>
                                             <div
@@ -850,6 +1301,16 @@ export function SidePanel() {
 
                 {activeTab === 'history' && (
                     <div className="history-list">
+                        <div className="search-box" style={{ padding: '12px', position: 'sticky', top: 0, background: 'var(--bg-primary)', borderBottom: '1px solid var(--border-color)', zIndex: 10 }}>
+                            <input
+                                type="text"
+                                className="input"
+                                placeholder="Search captures or tags..."
+                                value={searchTerm}
+                                onChange={(e) => setSearchTerm(e.target.value)}
+                                style={{ width: '100%', padding: '8px', fontSize: '13px' }}
+                            />
+                        </div>
                         {captures.length === 0 ? (
                             <div className="empty-state">
                                 <div className="empty-state-icon">📭</div>
@@ -860,8 +1321,15 @@ export function SidePanel() {
                             </div>
                         ) : (
                             (() => {
+                                const filtered = captures.filter(item => {
+                                    if (!searchTerm) return true;
+                                    const term = searchTerm.toLowerCase();
+                                    return (item.data.title?.toLowerCase().includes(term) ||
+                                        item.tags?.some(tag => tag.toLowerCase().includes(term)));
+                                });
+
                                 const groups: Record<string, CapturedItem[]> = {};
-                                captures.forEach(item => {
+                                filtered.forEach(item => {
                                     const key = item.batchId ?? item.id;
                                     if (!groups[key]) groups[key] = [];
                                     groups[key].push(item);
@@ -875,19 +1343,12 @@ export function SidePanel() {
                                                 groupKey={key}
                                                 group={group}
                                                 onSelectMarkdown={(markdown, mergedItem, batchItems) => {
-                                                    // Set export batch scope
                                                     setExportBatch(batchItems);
-
-                                                    // Update editor with the pre-generated full markdown (includes headers)
                                                     if (editor) {
                                                         const html = markdownToHtml(markdown);
                                                         editor.commands.setContent(html);
                                                     }
-
-                                                    // Set current capture to merged item for other context (e.g. filename)
                                                     setCurrentCapture(mergedItem.data);
-
-                                                    // Switch to capture tab (as requested by user flow "loads... into capture tab")
                                                     setActiveTab('capture');
                                                 }}
                                                 onSelectSingle={(item) => {
@@ -901,7 +1362,6 @@ export function SidePanel() {
                                             />
                                         );
                                     } else {
-                                        // Render Single
                                         const item = group[0];
                                         return (
                                             <div
@@ -915,15 +1375,31 @@ export function SidePanel() {
                                                 <div className="history-item-header">
                                                     <span className="history-item-title">
                                                         {item.data.title ?? 'Untitled'}
-                                                        {item.tags && item.tags.includes('bulk') && (
-                                                            <span style={{ fontSize: '10px', background: '#e0e0e0', color: '#666', padding: '2px 4px', borderRadius: '4px', marginLeft: '6px', fontWeight: 'bold' }}>
-                                                                BULK
-                                                            </span>
-                                                        )}
                                                     </span>
                                                     <span className="history-item-time">
                                                         {new Date(item.timestamp).toLocaleString()}
                                                     </span>
+                                                </div>
+                                                <div className="history-tag-list" style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginTop: '6px' }}>
+                                                    {item.tags?.map(tag => (
+                                                        <span key={tag} className="tag" style={{ fontSize: '10px', background: 'var(--bg-secondary)', border: '1px solid var(--border-color)', padding: '1px 6px', borderRadius: '10px', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                                            {tag}
+                                                            <span onClick={(e) => { e.stopPropagation(); handleRemoveTag(item.id, tag); }} style={{ cursor: 'pointer', opacity: 0.6 }}>×</span>
+                                                        </span>
+                                                    ))}
+                                                    <input
+                                                        type="text"
+                                                        placeholder="+ tag"
+                                                        style={{ background: 'transparent', border: 'none', fontSize: '10px', width: '40px', outline: 'none' }}
+                                                        onKeyDown={(e) => {
+                                                            if (e.key === 'Enter') {
+                                                                e.stopPropagation();
+                                                                handleAddTag(item.id, (e.target as HTMLInputElement).value);
+                                                                (e.target as HTMLInputElement).value = '';
+                                                            }
+                                                        }}
+                                                        onClick={(e) => e.stopPropagation()}
+                                                    />
                                                 </div>
                                                 <div className="history-item-preview">
                                                     {item.data.messages.length} messages from {item.data.source.provider_site}
@@ -1079,9 +1555,9 @@ export function SidePanel() {
                                 onChange={(e) => setBonsaiHost(e.target.value)}
                                 placeholder="http://localhost:8080"
                                 className="input"
-                                style={{ width: '100%', padding: '8px', border: '1px solid #ddd', borderRadius: '4px' }}
+                                style={{ width: '100%', padding: '8px', border: '1px solid var(--border-color)', borderRadius: '4px' }}
                             />
-                            <p style={{ fontSize: '12px', color: '#666', marginTop: '4px' }}>
+                            <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '4px' }}>
                                 URL of your running Bonsai instance
                             </p>
                         </div>
@@ -1157,27 +1633,27 @@ export function SidePanel() {
                         </div>
 
                         <div className="bulk-list" style={{
-                            border: '1px solid #eee',
+                            border: '1px solid var(--border-color)',
                             borderRadius: '4px',
                             height: '300px',
                             overflowY: 'auto',
                             marginBottom: '16px',
-                            backgroundColor: '#f9f9f9'
+                            backgroundColor: 'var(--bg-secondary)'
                         }}>
                             {bulkItems.length === 0 ? (
-                                <div className="empty-state" style={{ padding: '20px', textAlign: 'center', color: '#888' }}>
+                                <div className="empty-state" style={{ padding: '20px', textAlign: 'center', color: 'var(--text-secondary)' }}>
                                     No conversations found. <br />Click Scan to list sidebar items.
                                 </div>
                             ) : (
                                 bulkItems.map(item => (
                                     <div key={item.id} className={`bulk-item ${item.status}`} style={{
                                         padding: '8px',
-                                        borderBottom: '1px solid #eee',
+                                        borderBottom: '1px solid var(--border-color)',
                                         display: 'flex',
                                         alignItems: 'center',
                                         gap: '8px',
-                                        background: '#fff',
-                                        color: '#333'
+                                        background: 'var(--bg-primary)',
+                                        color: 'var(--text-primary)'
                                     }}>
                                         <input
                                             type="checkbox"
@@ -1223,11 +1699,18 @@ export function SidePanel() {
                                     isBulkCapturingRef.current = false;
                                     setIsBulkCapturing(false);
                                 }}
-                                style={{ width: '100%', marginTop: '8px', backgroundColor: '#d32f2f', color: 'white', border: 'none', padding: '8px' }}
+                                style={{ width: '100%', marginTop: '8px', backgroundColor: 'var(--error)', color: 'white', border: 'none', padding: '8px' }}
                             >
                                 Stop
                             </button>
                         )}
+
+                        <div style={{ marginTop: '12px', paddingTop: '10px', borderTop: '1px solid var(--border-color)', fontSize: '11px', color: 'var(--text-secondary)', lineHeight: '1.5' }}>
+                            <strong>Provider export:</strong>{' '}
+                            <a href="https://help.openai.com/en/articles/7260999-how-do-i-export-my-chatgpt-history-and-data" target="_blank" rel="noreferrer" style={{ color: 'var(--accent-primary)' }}>ChatGPT</a>,{' '}
+                            <a href="https://support.anthropic.com/en/articles/8945820-how-can-i-export-my-claude-ai-data" target="_blank" rel="noreferrer" style={{ color: 'var(--accent-primary)' }}>Claude</a>,{' '}
+                            <a href="https://support.google.com/gemini/answer/13743730" target="_blank" rel="noreferrer" style={{ color: 'var(--accent-primary)' }}>Gemini</a>
+                        </div>
                     </div>
                 )}
             </div>

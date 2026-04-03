@@ -31,6 +31,13 @@ npm run dev
 npm run build
 ```
 
+> **Adding new providers/adapters**
+> When you add a new content adapter under `src/content/adapters`, be sure to also update
+> `build.js` so that the script is included in the `ADAPTERS` map. Otherwise the
+> generated `manifest.json` will reference a `.js` file that doesn't exist, leading to
+> "Could not load javascript" errors when loading the unpacked extension.
+
+
 ### Load in Chrome
 
 1. Build the extension: `npm run build`

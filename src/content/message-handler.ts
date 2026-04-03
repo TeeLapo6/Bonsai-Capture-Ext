@@ -10,6 +10,19 @@ import type { CaptureScope } from '../shared/schema';
 // Initialize capture engine
 captureEngine.init();
 
+// Track the last focused editable element so that "Paste" can insert text there
+let lastFocusedInput: HTMLElement | null = null;
+document.addEventListener('focusin', (e: FocusEvent) => {
+    const target = e.target as HTMLElement;
+    if (
+        target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.isContentEditable
+    ) {
+        lastFocusedInput = target;
+    }
+}, true);
+
 // Listen for messages from the side panel
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     (async () => {
@@ -35,69 +48,80 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
                     // For now, let's just re-init and return.
                     break;
 
-                case 'CAPTURE':
-                    const messageIndex = message.messageIndex;
-                    let scope: CaptureScope = { type: 'entire_conversation' };
+                case 'CAPTURE': {
+                    const numericMessageIndex = Number(message.messageIndex);
+                    const messageIndex = Number.isFinite(numericMessageIndex) ? numericMessageIndex : undefined;
+                    let messageId = typeof message.messageId === 'string' && message.messageId ? message.messageId : undefined;
 
-                    // Handle legacy index-based scopes manually if needed, or map to scopes
-                    // But here we basically re-implement capture logic? 
-                    // Let's rely on captureEngine properly.
-
-                    // Actually, the existing logic manually filtered messages.
-                    // We must await adapter calls.
-                    switch (message.scope) {
-                        case 'entire':
-                            scope = { type: 'entire_conversation' };
-                            break;
-                        case 'single':
-                            if (messageIndex !== undefined) {
-                                const adapter = captureEngine.getAdapter();
-                                if (adapter) {
-                                    const messages = adapter.listMessages();
-                                    if (messages[messageIndex]) {
-                                        const singleMsg = await adapter.parseMessage(messages[messageIndex], messageIndex);
-                                        const graph = await adapter.captureConversation();
-                                        if (graph) {
-                                            graph.messages = [singleMsg];
-                                            sendResponse({ data: graph });
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                            break;
-                        case 'upto':
-                            if (messageIndex !== undefined) {
-                                const adapter = captureEngine.getAdapter();
-                                if (adapter) {
-                                    const graph = await adapter.captureConversation();
-                                    if (graph) {
-                                        graph.messages = graph.messages.slice(0, messageIndex + 1);
-                                        sendResponse({ data: graph });
-                                        return;
-                                    }
-                                }
-                            }
-                            break;
-                        case 'from':
-                            if (messageIndex !== undefined) {
-                                const adapter = captureEngine.getAdapter();
-                                if (adapter) {
-                                    const graph = await adapter.captureConversation();
-                                    if (graph) {
-                                        graph.messages = graph.messages.slice(messageIndex);
-                                        sendResponse({ data: graph });
-                                        return;
-                                    }
-                                }
-                            }
-                            break;
+                    if (!messageId && messageIndex !== undefined) {
+                        messageId = String(messageIndex);
                     }
 
-                    // Fallback to engine capture if custom logic didn't return
-                    const data = await captureEngine.capture(scope);
-                    sendResponse({ data });
-                    break;
+                    if (message.scope === 'entire') {
+                        const data = await captureEngine.capture({ type: 'entire_conversation' });
+                        sendResponse({ data });
+                        return;
+                    }
+
+                    if (messageId) {
+                        let scope: CaptureScope | null = null;
+
+                        if (message.scope === 'single') {
+                            scope = { type: 'single_message', message_id: messageId };
+                        } else if (message.scope === 'upto') {
+                            scope = { type: 'up_to_message', message_id: messageId };
+                        } else if (message.scope === 'from') {
+                            scope = { type: 'from_message', message_id: messageId };
+                        }
+
+                        if (scope) {
+                            const data = await captureEngine.capture(scope);
+                            if (data) {
+                                sendResponse({ data });
+                                return;
+                            }
+                        }
+                    }
+
+                    const adapter = captureEngine.getAdapter();
+
+                    // Legacy index-based fallback (for existing messageIndex path and when messageId isn't present)
+                    if (adapter) {
+                        const graph = await adapter.captureConversation();
+                        if (graph && messageIndex !== undefined && messageIndex >= 0 && messageIndex < graph.messages.length) {
+                            if (message.scope === 'single') {
+                                const single = graph.messages[messageIndex];
+                                if (single) {
+                                    graph.messages = [single];
+                                    graph.artifacts = graph.artifacts.filter(a => single.artifact_ids.includes(a.artifact_id));
+                                    sendResponse({ data: graph });
+                                    return;
+                                }
+                            }
+                            if (message.scope === 'upto') {
+                                const messages = graph.messages.slice(0, messageIndex + 1);
+                                const artifactIds = new Set(messages.flatMap(m => m.artifact_ids));
+                                graph.messages = messages;
+                                graph.artifacts = graph.artifacts.filter(a => artifactIds.has(a.artifact_id));
+                                sendResponse({ data: graph });
+                                return;
+                            }
+                            if (message.scope === 'from') {
+                                const messages = graph.messages.slice(messageIndex);
+                                const artifactIds = new Set(messages.flatMap(m => m.artifact_ids));
+                                graph.messages = messages;
+                                graph.artifacts = graph.artifacts.filter(a => artifactIds.has(a.artifact_id));
+                                sendResponse({ data: graph });
+                                return;
+                            }
+                        }
+                    }
+
+                    // General fallback
+                    const fallbackData = await captureEngine.capture({ type: 'entire_conversation' });
+                    sendResponse({ data: fallbackData });
+                    return;
+                }
 
                 case 'SCAN_SIDEBAR':
                     const scanAdapter = captureEngine.getAdapter();
@@ -128,6 +152,24 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
                         sendResponse({ success: false, error: 'No adapter available' });
                     }
                     break;
+
+                case 'PASTE_TEXT': {
+                    const pasteText = message.text as string;
+                    if (!pasteText) { sendResponse({ success: false }); break; }
+                    // Re-focus the last tracked input, then insert text
+                    const target = lastFocusedInput ?? (document.activeElement as HTMLElement | null);
+                    if (
+                        target &&
+                        (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)
+                    ) {
+                        target.focus();
+                        document.execCommand('insertText', false, pasteText);
+                        sendResponse({ success: true });
+                    } else {
+                        sendResponse({ success: false, error: 'No focused input found' });
+                    }
+                    break;
+                }
 
                 default:
                     sendResponse({ error: 'Unknown message type' });

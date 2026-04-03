@@ -10,8 +10,10 @@ import type {
     ArtifactNode,
     DeepLink,
     Provenance,
-    ConversationGraph
+    ConversationGraph,
+    ContentBlock
 } from '../../shared/schema';
+import { createMarkdownBlock } from '../../shared/schema';
 
 export interface SidebarItem {
     id: string;
@@ -23,6 +25,34 @@ export interface ParsedConversation {
     url: string;
     container: Element;
     title?: string;
+}
+
+export interface ExtractedFrameContent {
+    frameId?: number;
+    url: string;
+    title: string;
+    text: string;
+    html: string;
+    isTop: boolean;
+}
+
+export interface OpenAIProbeEntry {
+    kind: string;
+    url: string;
+    contentType?: string;
+    body: string;
+    timestamp: number;
+    status?: number;
+}
+
+export interface OpenAIProbeSnapshot {
+    frameId?: number;
+    url: string;
+    title: string;
+    isTop: boolean;
+    bodyText: string;
+    bodyHtml: string;
+    entries: OpenAIProbeEntry[];
 }
 
 export interface ProviderAdapter {
@@ -113,6 +143,571 @@ export abstract class BaseAdapter implements ProviderAdapter {
         return false;
     }
 
+    protected async parseVisibleArtifacts(): Promise<ArtifactNode[]> {
+        return [];
+    }
+
+    protected getArtifactDedupKey(artifact: ArtifactNode): string {
+        const content = typeof artifact.content === 'string'
+            ? artifact.content.slice(0, 500)
+            : JSON.stringify(artifact.content).slice(0, 500);
+
+        return [
+            artifact.type,
+            artifact.title ?? '',
+            artifact.view_url ?? '',
+            artifact.source_url ?? '',
+            content,
+        ].join('|');
+    }
+
+    protected createArtifactReferenceBlock(artifacts: ArtifactNode[]): ContentBlock | null {
+        if (artifacts.length === 0) {
+            return null;
+        }
+
+        const appendixArtifacts = artifacts.filter((artifact) => {
+            if (artifact.type === 'deep_research' || artifact.type === 'file') {
+                return true;
+            }
+
+            if (artifact.mime_type === 'text/html' && typeof artifact.content === 'string' && artifact.content.length > 1200) {
+                return true;
+            }
+
+            if (artifact.type === 'artifact_doc' && (artifact.view_url || artifact.source_url)) {
+                return true;
+            }
+
+            return artifact.type === 'artifact_doc'
+                && typeof artifact.content === 'string'
+                && artifact.content.length > 1800;
+        });
+
+        if (appendixArtifacts.length === 0) {
+            return null;
+        }
+
+        const lines = appendixArtifacts.map((artifact, index) => {
+            const title = artifact.title?.trim() || `${artifact.type.replace(/_/g, ' ')} ${index + 1}`;
+            return `- [${title}](#artifact-${artifact.artifact_id})`;
+        });
+
+        return createMarkdownBlock(`See appendix:\n\n${lines.join('\n')}`);
+    }
+
+    protected extractArtifactLinks(el: Element): { viewUrl?: string; sourceUrl?: string } {
+        const candidates: Array<{ url: string; label: string; kind: 'link' | 'frame' }> = [];
+
+        const pushUrl = (rawUrl: string | null | undefined, label: string, kind: 'link' | 'frame') => {
+            if (!rawUrl) return;
+
+            try {
+                candidates.push({
+                    url: new URL(rawUrl, window.location.href).href,
+                    label: label.trim().toLowerCase(),
+                    kind,
+                });
+            } catch {
+                candidates.push({
+                    url: rawUrl,
+                    label: label.trim().toLowerCase(),
+                    kind,
+                });
+            }
+        };
+
+        const selfLinkUrl = el.getAttribute('href')
+            ?? el.getAttribute('data-href')
+            ?? el.getAttribute('data-url');
+        if (selfLinkUrl) {
+            const selfLabel = el.getAttribute('aria-label')
+                ?? el.getAttribute('title')
+                ?? el.textContent
+                ?? '';
+            pushUrl(selfLinkUrl, selfLabel, 'link');
+        }
+
+        if (el.matches('iframe[src], embed[src], object[data]')) {
+            const selfFrameUrl = el.getAttribute('src') ?? el.getAttribute('data');
+            const selfFrameLabel = el.getAttribute('title') ?? el.getAttribute('aria-label') ?? 'embedded content';
+            pushUrl(selfFrameUrl, selfFrameLabel, 'frame');
+        }
+
+        Array.from(el.querySelectorAll('a[href], [data-href], [data-url]')).forEach((candidate) => {
+            const rawUrl = candidate.getAttribute('href')
+                ?? candidate.getAttribute('data-href')
+                ?? candidate.getAttribute('data-url');
+            const label = candidate.getAttribute('aria-label')
+                ?? candidate.getAttribute('title')
+                ?? candidate.textContent
+                ?? '';
+            pushUrl(rawUrl, label, 'link');
+        });
+
+        Array.from(el.querySelectorAll('iframe[src], embed[src], object[data]')).forEach((candidate) => {
+            const rawUrl = candidate.getAttribute('src') ?? candidate.getAttribute('data');
+            const label = candidate.getAttribute('title') ?? candidate.getAttribute('aria-label') ?? 'embedded content';
+            pushUrl(rawUrl, label, 'frame');
+        });
+
+        let viewUrl: string | undefined;
+        let sourceUrl: string | undefined;
+
+        for (const candidate of candidates) {
+            if (!sourceUrl && (candidate.kind === 'frame' || /download|export|source|raw|file|open in new/.test(candidate.label))) {
+                sourceUrl = candidate.url;
+                continue;
+            }
+
+            if (!viewUrl && /open|view|preview|artifact|report|canvas|diagram/.test(candidate.label)) {
+                viewUrl = candidate.url;
+            }
+        }
+
+        if (!viewUrl) {
+            viewUrl = candidates.find((candidate) => candidate.kind === 'link')?.url;
+        }
+
+        if (!sourceUrl) {
+            sourceUrl = candidates.find((candidate) => candidate.kind === 'frame')?.url;
+        }
+
+        if (sourceUrl && !viewUrl) {
+            viewUrl = sourceUrl;
+        }
+
+        return { viewUrl, sourceUrl };
+    }
+
+    protected cleanArtifactText(text: string): string {
+        let sanitized = this.sanitizeMessageText(text);
+        sanitized = sanitized.replace(/\b(chatgpt|claude|gemini)\s+said:\s*/gim, '');
+        sanitized = sanitized.replace(/(^|\n)\s*(inserted\s*this\s*message|insert(?:ed)?|this\s*message|up\s*to\s*message|this\s*\+\s*following|artifact\s*links|open|download|source|copy|edit|retry|share)\s*(?=\n|$)/gim, '$1');
+        sanitized = sanitized.replace(/\n{3,}/g, '\n\n').trim();
+        return sanitized;
+    }
+
+    protected isNoiseOnlyArtifactText(text: string): boolean {
+        const normalized = this.cleanArtifactText(text)
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+
+        if (!normalized) {
+            return true;
+        }
+
+        return /^(artifact|artifact links|open|download|source|insert(ed)?|this message|up to message|chatgpt said|claude said|gemini said)$/.test(normalized);
+    }
+
+    protected svgToDataUrl(svg: SVGSVGElement): string {
+        const markup = new XMLSerializer().serializeToString(svg);
+        return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(markup)}`;
+    }
+
+    protected canvasToDataUrl(canvas: HTMLCanvasElement): string | null {
+        try {
+            return canvas.toDataURL('image/png');
+        } catch {
+            return null;
+        }
+    }
+
+    protected async fetchRemoteResource(url: string): Promise<{
+        ok: boolean;
+        contentType?: string;
+        text?: string;
+        dataUrl?: string;
+        finalUrl?: string;
+        contentDisposition?: string;
+        error?: string;
+    } | null> {
+        if (!url || typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) {
+            return null;
+        }
+
+        try {
+            const response = await chrome.runtime.sendMessage({
+                type: 'FETCH_REMOTE_RESOURCE',
+                url,
+            });
+
+            if (!response || typeof response !== 'object') {
+                return null;
+            }
+
+            return response;
+        } catch {
+            return null;
+        }
+    }
+
+    protected async extractAllFrames(): Promise<ExtractedFrameContent[]> {
+        if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) {
+            return [];
+        }
+
+        try {
+            const response = await chrome.runtime.sendMessage({
+                type: 'EXTRACT_ALL_FRAMES',
+            });
+
+            if (!response || typeof response !== 'object' || !Array.isArray(response.frames)) {
+                return [];
+            }
+
+            return (response.frames as unknown[]).flatMap((frame) => {
+                if (!frame || typeof frame !== 'object') {
+                    return [];
+                }
+
+                const candidate = frame as Partial<ExtractedFrameContent>;
+                if (
+                    typeof candidate.url !== 'string'
+                    || typeof candidate.title !== 'string'
+                    || typeof candidate.text !== 'string'
+                    || typeof candidate.html !== 'string'
+                    || typeof candidate.isTop !== 'boolean'
+                ) {
+                    return [];
+                }
+
+                return [candidate as ExtractedFrameContent];
+            });
+        } catch {
+            return [];
+        }
+    }
+
+    protected async getOpenAIResearchProbeData(): Promise<OpenAIProbeSnapshot[]> {
+        if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) {
+            return [];
+        }
+
+        try {
+            const response = await chrome.runtime.sendMessage({
+                type: 'GET_OPENAI_RESEARCH_PROBE_DATA',
+            });
+
+            if (!response || typeof response !== 'object' || !Array.isArray(response.snapshots)) {
+                return [];
+            }
+
+            return (response.snapshots as unknown[]).flatMap((snapshot) => {
+                if (!snapshot || typeof snapshot !== 'object') {
+                    return [];
+                }
+
+                const candidate = snapshot as Partial<OpenAIProbeSnapshot>;
+                if (
+                    typeof candidate.url !== 'string'
+                    || typeof candidate.title !== 'string'
+                    || typeof candidate.isTop !== 'boolean'
+                    || typeof candidate.bodyText !== 'string'
+                    || typeof candidate.bodyHtml !== 'string'
+                    || !Array.isArray(candidate.entries)
+                ) {
+                    return [];
+                }
+
+                const entries = candidate.entries.flatMap((entry) => {
+                    if (!entry || typeof entry !== 'object') {
+                        return [];
+                    }
+
+                    const normalizedEntry = entry as Partial<OpenAIProbeEntry>;
+                    if (
+                        typeof normalizedEntry.kind !== 'string'
+                        || typeof normalizedEntry.url !== 'string'
+                        || typeof normalizedEntry.body !== 'string'
+                        || typeof normalizedEntry.timestamp !== 'number'
+                    ) {
+                        return [];
+                    }
+
+                    return [normalizedEntry as OpenAIProbeEntry];
+                });
+
+                return [{
+                    ...(candidate as OpenAIProbeSnapshot),
+                    entries,
+                }];
+            });
+        } catch {
+            return [];
+        }
+    }
+
+    protected extractFetchedDocumentContent(
+        raw: string,
+        baseUrl: string
+    ): { html?: string; text: string; title?: string } | null {
+        const trimmed = raw.trim();
+        if (!trimmed) {
+            return null;
+        }
+
+        const looksLikeHtml = /<(html|body|main|article|section|div|p|h1|h2)\b/i.test(trimmed);
+        if (!looksLikeHtml) {
+            const text = this.cleanArtifactText(trimmed);
+            return text ? { text } : null;
+        }
+
+        const parsed = new DOMParser().parseFromString(raw, 'text/html');
+        const title = this.cleanArtifactText(parsed.querySelector('title')?.textContent?.trim() ?? '');
+        const root = parsed.querySelector(
+            'main, article, [role="main"], .prose, .markdown, [data-testid*="research"], [class*="research"], [class*="report"]'
+        ) ?? parsed.body;
+
+        if (!root) {
+            return null;
+        }
+
+        root.querySelectorAll('[href], [src]').forEach((node) => {
+            const href = node.getAttribute('href');
+            if (href) {
+                try {
+                    node.setAttribute('href', new URL(href, baseUrl).href);
+                } catch {
+                    // Keep original value if URL resolution fails.
+                }
+            }
+
+            const src = node.getAttribute('src');
+            if (src) {
+                try {
+                    node.setAttribute('src', new URL(src, baseUrl).href);
+                } catch {
+                    // Keep original value if URL resolution fails.
+                }
+            }
+        });
+
+        const html = this.sanitizeRichHtml(root, {
+            removeSelectors: ['header nav', 'footer', 'button', '[role="button"]'],
+        });
+        const text = this.cleanArtifactText(root.textContent ?? '');
+
+        if ((!html || this.isNoiseOnlyArtifactText(html.replace(/<[^>]+>/g, ' ')))
+            && (!text || this.isNoiseOnlyArtifactText(text))) {
+            return null;
+        }
+
+        return {
+            html: html || undefined,
+            text,
+            title: title || undefined,
+        };
+    }
+
+    protected guessArtifactFilename(
+        title: string | undefined,
+        contentType?: string,
+        url?: string,
+        contentDisposition?: string
+    ): string {
+        const dispositionMatch = contentDisposition?.match(/filename\*?=(?:UTF-8''|\")?([^;\"]+)/i);
+        if (dispositionMatch?.[1]) {
+            try {
+                return decodeURIComponent(dispositionMatch[1].trim().replace(/^"|"$/g, ''));
+            } catch {
+                return dispositionMatch[1].trim().replace(/^"|"$/g, '');
+            }
+        }
+
+        const fromUrl = (() => {
+            if (!url) return '';
+
+            try {
+                const pathname = new URL(url).pathname;
+                return pathname.split('/').filter(Boolean).pop() ?? '';
+            } catch {
+                return '';
+            }
+        })();
+
+        if (fromUrl && /\.[a-z0-9]{2,8}$/i.test(fromUrl)) {
+            return fromUrl;
+        }
+
+        const baseName = (title ?? 'captured-artifact')
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '') || 'captured-artifact';
+
+        const extension = (() => {
+            switch ((contentType ?? '').split(';')[0].trim().toLowerCase()) {
+                case 'application/pdf':
+                    return 'pdf';
+                case 'text/html':
+                    return 'html';
+                case 'text/markdown':
+                case 'text/x-markdown':
+                    return 'md';
+                case 'text/plain':
+                    return 'txt';
+                case 'application/json':
+                    return 'json';
+                case 'image/svg+xml':
+                    return 'svg';
+                default:
+                    return 'bin';
+            }
+        })();
+
+        return `${baseName}.${extension}`;
+    }
+
+    /**
+     * Normalize and sanitize the extracted text for markdown blocks.
+     */
+    protected sanitizeMessageText(text: string): string {
+        let sanitized = text;
+
+        // Remove chat quote markers (carats '>' from quoted blocks)
+        sanitized = sanitized.replace(/^\s*>+\s?/gm, '');
+
+        // Remove ChatGPT/Gemini/Claude labels that may appear in the text capture
+        sanitized = sanitized.replace(/^\s*(👤\s*User|🤖\s*Assistant|\w+ AI|Conversation)\s*[\r\n]*/gim, '');
+
+        // Remove source-specific prefix markers (including quoted variants)
+        sanitized = sanitized.replace(/(^|\n)\s*(>\s*)*You said:?(\s*)/gim, '$1');
+        sanitized = sanitized.replace(/(^|\n)\s*(show thinking\s+)?(?:chatgpt|claude|gemini)\s+said:?(\s*)/gim, '$1');
+        sanitized = sanitized.replace(/(^|\n)\s*show thinking\s*(?=\n|$)/gim, '$1');
+
+        // Remove excess markdown quote block indicators
+        sanitized = sanitized.replace(/(^|\n)\s*>\s*/g, '$1');
+
+        // Collapse excessive blank lines and trim
+        sanitized = sanitized.replace(/\n{3,}/g, '\n\n').trim();
+
+        return sanitized;
+    }
+
+    /**
+     * Resolve a provider-visible link from an artifact element.
+     */
+    protected extractArtifactViewUrl(el: Element): string | undefined {
+        const candidates: Array<Element | null> = [
+            el.closest('a[href]'),
+            el.querySelector('a[href]'),
+            el.querySelector('[data-href]'),
+            el.querySelector('[data-url]'),
+            el.closest('[data-href]'),
+            el.closest('[data-url]')
+        ];
+
+        for (const candidate of candidates) {
+            if (!candidate) continue;
+
+            const rawHref = candidate.getAttribute('href')
+                ?? candidate.getAttribute('data-href')
+                ?? candidate.getAttribute('data-url');
+
+            if (!rawHref) continue;
+
+            try {
+                return new URL(rawHref, window.location.href).href;
+            } catch {
+                return rawHref;
+            }
+        }
+
+        return undefined;
+    }
+
+    /**
+     * Preserve provider-authored structure such as tables and code blocks while
+     * stripping interactive or unsafe elements that do not belong in captures.
+     */
+    protected sanitizeRichHtml(
+        el: Element,
+        options?: {
+            removeSelectors?: string[];
+        }
+    ): string {
+        const clone = el.cloneNode(true) as Element;
+        const removeSelectors = [
+            'style',
+            'script',
+            'link',
+            'meta',
+            'noscript',
+            'iframe',
+            'form',
+            'button',
+            '[role="button"]',
+            'svg',
+            '.bonsai-insert-btn',
+            ...(options?.removeSelectors ?? []),
+        ];
+
+        clone.querySelectorAll(removeSelectors.join(', ')).forEach((node) => node.remove());
+
+        Array.from(clone.querySelectorAll('*'))
+            .filter((node) => node.tagName.includes('-'))
+            .forEach((node) => {
+                const children = Array.from(node.childNodes);
+                if (children.length > 0) {
+                    node.replaceWith(...children);
+                } else {
+                    node.remove();
+                }
+            });
+
+        const allowedAttributes = new Set([
+            'href',
+            'src',
+            'alt',
+            'title',
+            'class',
+            'colspan',
+            'rowspan',
+        ]);
+
+        clone.querySelectorAll('*').forEach((node) => {
+            Array.from(node.attributes).forEach((attr) => {
+                const name = attr.name.toLowerCase();
+                if (name.startsWith('on') || !allowedAttributes.has(name)) {
+                    node.removeAttribute(attr.name);
+                }
+            });
+        });
+
+        // Normalize provider-specific code markup into plain semantic pre/code blocks.
+        clone.querySelectorAll('pre').forEach((pre) => {
+            const codeEl = pre.querySelector('code') ?? pre;
+            const language = this.detectCodeLanguage(codeEl).trim();
+            const normalizedCode = document.createElement('code');
+
+            if (language) {
+                normalizedCode.className = `language-${language}`;
+            }
+
+            normalizedCode.textContent = pre.textContent ?? '';
+            pre.replaceChildren(normalizedCode);
+            pre.removeAttribute('class');
+        });
+
+        clone.querySelectorAll('code').forEach((codeEl) => {
+            if (codeEl.closest('pre')) {
+                return;
+            }
+
+            const language = this.detectCodeLanguage(codeEl).trim();
+            codeEl.textContent = codeEl.textContent ?? '';
+
+            if (language) {
+                codeEl.className = `language-${language}`;
+            } else {
+                codeEl.removeAttribute('class');
+            }
+        });
+
+        return clone.innerHTML.trim();
+    }
+
     subscribeNewMessages(callback: (el: Element) => void): () => void {
         const conversation = this.detectConversation();
         if (!conversation) return () => { };
@@ -164,19 +759,54 @@ export abstract class BaseAdapter implements ProviderAdapter {
             artifacts: []
         };
 
+        const artifactsByMessageId = new Map<string, ArtifactNode[]>();
+        const seenArtifactKeys = new Set<string>();
+
+        const attachArtifacts = (message: MessageNode, artifacts: ArtifactNode[]) => {
+            if (artifacts.length === 0) {
+                return;
+            }
+
+            const messageArtifacts = artifactsByMessageId.get(message.message_id) ?? [];
+            artifactsByMessageId.set(message.message_id, messageArtifacts);
+
+            artifacts.forEach((artifact) => {
+                const dedupeKey = this.getArtifactDedupKey(artifact);
+                if (seenArtifactKeys.has(dedupeKey)) {
+                    return;
+                }
+
+                seenArtifactKeys.add(dedupeKey);
+                artifact.source_message_id = message.message_id;
+                message.artifact_ids.push(artifact.artifact_id);
+                graph.artifacts.push(artifact);
+                messageArtifacts.push(artifact);
+            });
+        };
+
         for (const [index, el] of messages.entries()) {
             const message = await this.parseMessage(el, index);
             const artifacts = await this.parseArtifacts(el);
 
-            // Link artifacts to message
-            artifacts.forEach(artifact => {
-                artifact.source_message_id = message.message_id;
-                message.artifact_ids.push(artifact.artifact_id);
-                graph.artifacts.push(artifact);
-            });
+            attachArtifacts(message, artifacts);
 
             graph.messages.push(message);
         }
+
+        const visibleArtifacts = await this.parseVisibleArtifacts();
+        const targetMessage = [...graph.messages].reverse().find((message) => message.role === 'assistant')
+            ?? graph.messages[graph.messages.length - 1];
+
+        if (targetMessage) {
+            attachArtifacts(targetMessage, visibleArtifacts);
+        }
+
+        graph.messages.forEach((message) => {
+            const referenceBlock = this.createArtifactReferenceBlock(artifactsByMessageId.get(message.message_id) ?? []);
+            if (referenceBlock) {
+                message.content_blocks.push(referenceBlock);
+            }
+        });
 
         return graph;
     }
