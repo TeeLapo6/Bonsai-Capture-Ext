@@ -43,12 +43,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true; // Keep channel open for async response
     }
 
-    if (message.type === 'SEND_TO_BONSAI') {
-        // In the future, this could make an API call to Bonsai
-        console.log('Would send to Bonsai:', message.data);
-        sendResponse({ success: true });
-    }
-
     if (message.type === 'INSERT_FROM_DOM') {
         // Store selected message for side panel to pick up
         chrome.storage.local.set({
@@ -636,17 +630,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             }
         })();
         return true;
-    }
-
-    if (message.type === 'UPDATE_CONFIG') {
-        const { host, apiKey } = message.payload;
-        chrome.storage.local.set({
-            bonsaiHost: host,
-            bonsaiApiKey: apiKey
-        }, () => {
-            sendResponse({ success: true });
-        });
-        return true; // Async response
     }
 
     return false;

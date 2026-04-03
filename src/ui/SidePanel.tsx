@@ -22,14 +22,13 @@ import { exportToMarkdown } from '../shared/exporters/markdown';
 import { exportToJSON } from '../shared/exporters/json';
 
 import { exportToTOONString } from '../shared/exporters/toon';
-import { toBonsaiImportPackage } from '../shared/bonsai-adapter';
 import { markdownToHtml } from '../shared/markdown-to-html';
 import { renderConversationGraphToHtml } from '../shared/render-preview-html';
 import bonsaiLogo from '../../../Bonsai-WebUI/src/components/icons/bonsai.png';
 
 import JSZip from 'jszip';
 
-type TabType = 'capture' | 'history' | 'export' | 'settings' | 'bulk';
+type TabType = 'capture' | 'history' | 'export' | 'bulk';
 type ThemePreference = 'light' | 'dark' | 'system';
 
 const THEME_STORAGE_KEY = 'bonsai-capture-theme';
@@ -276,13 +275,9 @@ export function SidePanel() {
     const [isBulkCapturing, setIsBulkCapturing] = useState(false);
     const [bulkLimit, setBulkLimit] = useState(10);
     const [bulkDelay, setBulkDelay] = useState(3000);
-    const [bonsaiHost, setBonsaiHost] = useState('http://localhost:8080');
-    const [bonsaiApiKey, setBonsaiApiKey] = useState('');
     const isBulkCapturingRef = useRef(false);
     const [lightboxImage, setLightboxImage] = useState<string | null>(null);
     const [exportBatch, setExportBatch] = useState<CapturedItem[] | null>(null);
-    const [isImporting, setIsImporting] = useState(false);
-    const [importProgress, setImportProgress] = useState(0);
     const [searchTerm, setSearchTerm] = useState('');
     const [captureSearchQuery, setCaptureSearchQuery] = useState('');
     const [captureSearchMiss, setCaptureSearchMiss] = useState(false);
@@ -543,11 +538,9 @@ export function SidePanel() {
 
     // Load captures from storage
     useEffect(() => {
-        chrome.storage.local.get(['captures', 'insertMode', 'bonsaiHost', 'bonsaiApiKey', 'captureMetadataOptions'], (result) => {
+        chrome.storage.local.get(['captures', 'insertMode', 'captureMetadataOptions'], (result) => {
             setCaptures(result.captures ?? []);
             if (result.insertMode) setInsertMode(result.insertMode);
-            if (result.bonsaiHost) setBonsaiHost(result.bonsaiHost);
-            if (result.bonsaiApiKey) setBonsaiApiKey(result.bonsaiApiKey);
             if (result.captureMetadataOptions) {
                 setCaptureMetadataOptions({
                     ...DEFAULT_CAPTURE_METADATA_OPTIONS,
@@ -733,11 +726,6 @@ export function SidePanel() {
                 filename = `${currentCapture.title ?? 'conversation'}.toon.json`;
                 mimeType = 'application/json';
                 break;
-            case 'bonsai':
-                content = JSON.stringify(toBonsaiImportPackage(currentCapture), null, 2);
-                filename = `${currentCapture.title ?? 'conversation'}.bonsai.json`;
-                mimeType = 'application/json';
-                break;
             default:
                 return;
         }
@@ -868,91 +856,6 @@ export function SidePanel() {
         }));
     };
 
-    const handleImportToBonsai = async () => {
-        if (!currentCapture) return;
-        setIsImporting(true);
-        setImportProgress(0);
-
-        try {
-            const importPkg = toBonsaiImportPackage(currentCapture);
-
-            const response = await fetch(`${bonsaiHost.replace(/\/$/, '')}/api/import/conversation`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `ApiKey ${bonsaiApiKey}`
-                },
-                body: JSON.stringify(importPkg)
-            });
-
-            if (!response.ok) {
-                const err = await response.text();
-                throw new Error(err || `Import failed: ${response.statusText}`);
-            }
-
-            const result = await response.json();
-            const conversationUrl = `${bonsaiHost.replace(/\/$/, '')}/c/${result.conversation_id}`;
-            window.open(conversationUrl, '_blank');
-
-            // alert('Imported successfully!');
-        } catch (e: any) {
-            console.error('Import Error:', e);
-            alert(`Error importing to Bonsai: ${e.message}\nMake sure your Host and API Key are correct in Settings.`);
-        } finally {
-            setIsImporting(false);
-            setImportProgress(0);
-        }
-    };
-
-    const handleBulkImportToBonsai = async (items: CapturedItem[]) => {
-        if (items.length === 0) return;
-        setIsImporting(true);
-        setImportProgress(0);
-
-        let successCount = 0;
-        let failCount = 0;
-
-        try {
-            for (let i = 0; i < items.length; i++) {
-                const item = items[i];
-                try {
-                    const importPkg = toBonsaiImportPackage(item.data);
-                    const response = await fetch(`${bonsaiHost.replace(/\/$/, '')}/api/import/conversation`, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Authorization': `ApiKey ${bonsaiApiKey}`
-                        },
-                        body: JSON.stringify(importPkg)
-                    });
-
-                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                    successCount++;
-                } catch (e) {
-                    console.error(`Failed to import item ${i}:`, e);
-                    failCount++;
-                }
-                setImportProgress(Math.round(((i + 1) / items.length) * 100));
-            }
-
-            alert(`Bulk import complete.\nSuccess: ${successCount}\nFailed: ${failCount}`);
-        } catch (e: any) {
-            alert(`Bulk import failed: ${e.message}`);
-        } finally {
-            setIsImporting(false);
-            setImportProgress(0);
-        }
-    };
-
-    const handleSaveSettings = () => {
-        chrome.storage.local.set({ bonsaiHost, bonsaiApiKey }, () => {
-            // Simple visual feedback could be added here
-            const btn = document.getElementById('save-settings-btn');
-            if (btn) btn.textContent = 'Saved!';
-            setTimeout(() => { if (btn) btn.textContent = 'Save Settings'; }, 1000);
-        });
-    };
-
     const handleInsertToEditor = useCallback((item: CapturedItem) => {
         if (!editor) return;
 
@@ -1079,18 +982,6 @@ export function SidePanel() {
                 </div>
             )}
 
-            {isImporting && (
-                <div className="import-progress-overlay">
-                    <div className="import-progress-bar">
-                        <div
-                            className="import-progress-fill"
-                            style={{ width: `${importProgress}%` }}
-                        ></div>
-                    </div>
-                    <div className="import-progress-text">Importing... {importProgress}%</div>
-                </div>
-            )}
-
             <nav className="tabs">
                 <button
                     className={`tab ${activeTab === 'capture' ? 'active' : ''}`}
@@ -1109,12 +1000,6 @@ export function SidePanel() {
                     onClick={() => setActiveTab('export')}
                 >
                     Export
-                </button>
-                <button
-                    className={`tab ${activeTab === 'settings' ? 'active' : ''}`}
-                    onClick={() => setActiveTab('settings')}
-                >
-                    Settings
                 </button>
                 <button
                     className={`tab ${activeTab === 'bulk' ? 'active' : ''}`}
@@ -1483,23 +1368,7 @@ export function SidePanel() {
                                     >
                                         🌳 TOON
                                     </button>
-                                    <button
-                                        className="btn btn-secondary"
-                                        onClick={() => handleExport('bonsai')}
-                                        disabled={!!exportBatch}
-                                    >
-                                        🌿 Bonsai Import
-                                    </button>
                                 </div>
-
-                                <button
-                                    className="btn btn-primary btn-full"
-                                    style={{ marginTop: '16px' }}
-                                    onClick={handleImportToBonsai}
-                                    disabled={isImporting}
-                                >
-                                    {isImporting ? '⏳ Importing...' : '🚀 Send to Bonsai App'}
-                                </button>
                             </>
                         )}
 
@@ -1529,47 +1398,9 @@ export function SidePanel() {
                                     >
                                         📦 ZIP (JSON)
                                     </button>
-                                    <button
-                                        className="btn btn-primary"
-                                        onClick={() => handleBulkImportToBonsai(exportBatch)}
-                                        title={`Import all ${exportBatch.length} items to Bonsai`}
-                                        disabled={isImporting}
-                                    >
-                                        🚀 Send to Bonsai
-                                    </button>
                                 </div>
                             </div>
                         )}
-                    </div>
-                )}
-
-                {activeTab === 'settings' && (
-                    <div className="settings-panel" style={{ padding: '16px' }}>
-                        <div className="form-group" style={{ marginBottom: '16px' }}>
-                            <label style={{ display: 'block', marginBottom: '8px', fontWeight: 500 }}>
-                                Bonsai Host URL
-                            </label>
-                            <input
-                                type="text"
-                                value={bonsaiHost}
-                                onChange={(e) => setBonsaiHost(e.target.value)}
-                                placeholder="http://localhost:8080"
-                                className="input"
-                                style={{ width: '100%', padding: '8px', border: '1px solid var(--border-color)', borderRadius: '4px' }}
-                            />
-                            <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '4px' }}>
-                                URL of your running Bonsai instance
-                            </p>
-                        </div>
-
-                        <button
-                            id="save-settings-btn"
-                            className="btn btn-primary"
-                            onClick={handleSaveSettings}
-                            style={{ width: '100%' }}
-                        >
-                            Save Settings
-                        </button>
                     </div>
                 )}
 
