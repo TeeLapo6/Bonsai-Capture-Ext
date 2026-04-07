@@ -793,6 +793,19 @@ a:hover {
   color: var(--text-secondary);
 }
 
+.capture-provider-setting {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.capture-provider-setting-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
 .history-list {
   display: flex;
   flex-direction: column;

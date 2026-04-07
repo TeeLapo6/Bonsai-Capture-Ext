@@ -6,6 +6,7 @@
 
 import { captureEngine } from './capture-engine';
 import type { CaptureScope } from '../shared/schema';
+import type { ProviderCaptureSettings } from '../shared/capture-settings';
 
 // Initialize capture engine
 captureEngine.init();
@@ -49,6 +50,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
                     break;
 
                 case 'CAPTURE': {
+                    captureEngine.applyProviderCaptureSettings(message.providerCaptureSettings as Partial<ProviderCaptureSettings> | null | undefined);
+
                     const numericMessageIndex = Number(message.messageIndex);
                     const messageIndex = Number.isFinite(numericMessageIndex) ? numericMessageIndex : undefined;
                     let messageId = typeof message.messageId === 'string' && message.messageId ? message.messageId : undefined;

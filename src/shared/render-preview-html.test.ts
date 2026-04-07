@@ -244,6 +244,134 @@ describe('renderConversationGraphToHtml', () => {
         expect(html).toContain('class="bonsai-deep-research"');
     });
 
+    it('renders linked Claude document artifacts in the appendix without duplicating them inline', () => {
+        const graph: ConversationGraph = {
+            conversation_id: 'conv_6',
+            title: 'Claude Artifact Appendix',
+            source: {
+                provider_site: 'claude.ai',
+                url: 'https://claude.ai/chat/example',
+                captured_at: '2026-04-03T12:00:00.000Z',
+                capture_version: '0.1.0',
+            },
+            provenance: {
+                provider: 'anthropic',
+                model: 'sonnet-4.5',
+                confidence: 'observed',
+            },
+            messages: [
+                {
+                    message_id: 'msg_1',
+                    role: 'assistant',
+                    sequence: 0,
+                    created_at: '2026-04-03T12:00:01.000Z',
+                    origin: {
+                        provider: 'anthropic',
+                        model: 'sonnet-4.5',
+                        confidence: 'observed',
+                    },
+                    content_blocks: [
+                        {
+                            type: 'html',
+                            value: '<p>Here is the summary for the main response.</p>',
+                        },
+                        {
+                            type: 'markdown',
+                            value: 'See appendix:\n\n- [Bonsai engine llm blocks supplement](#artifact-artifact_doc_1)',
+                        },
+                    ],
+                    artifact_ids: ['artifact_doc_1'],
+                    deep_link: {
+                        url: 'https://claude.ai/chat/example',
+                    },
+                },
+            ],
+            artifacts: [
+                {
+                    artifact_id: 'artifact_doc_1',
+                    type: 'artifact_doc',
+                    title: 'Bonsai engine llm blocks supplement',
+                    mime_type: 'text/html',
+                    content: '<section><p>CLI flags integration belongs in the execution context section.</p></section>',
+                    source_message_id: 'msg_1',
+                    source_url: 'https://claude.ai/download/supplement.md',
+                    view_url: 'https://claude.ai/download/supplement.md',
+                    exportable: true,
+                },
+            ],
+        };
+
+        const html = renderConversationGraphToHtml(graph);
+
+        expect(html).toContain('<h2>Appendix</h2>');
+        expect(html).toContain('Bonsai engine llm blocks supplement');
+        expect(html).toContain('CLI flags integration belongs in the execution context section.');
+        expect(html).toContain('See appendix:');
+    });
+
+    it('renders linked Claude code artifacts in the appendix', () => {
+        const graph: ConversationGraph = {
+            conversation_id: 'conv_7',
+            title: 'Claude Code Artifact Appendix',
+            source: {
+                provider_site: 'claude.ai',
+                url: 'https://claude.ai/chat/example',
+                captured_at: '2026-04-05T12:00:00.000Z',
+                capture_version: '0.1.0',
+            },
+            provenance: {
+                provider: 'anthropic',
+                model: 'sonnet-4.5',
+                confidence: 'observed',
+            },
+            messages: [
+                {
+                    message_id: 'msg_code_1',
+                    role: 'assistant',
+                    sequence: 0,
+                    created_at: '2026-04-05T12:00:01.000Z',
+                    origin: {
+                        provider: 'anthropic',
+                        model: 'sonnet-4.5',
+                        confidence: 'observed',
+                    },
+                    content_blocks: [
+                        {
+                            type: 'html',
+                            value: '<p>Here is the updated diagram.</p>',
+                        },
+                        {
+                            type: 'markdown',
+                            value: 'See appendix:\n\n- [Architecture Mermaid](#artifact-artifact_code_1)',
+                        },
+                    ],
+                    artifact_ids: ['artifact_code_1'],
+                    deep_link: {
+                        url: 'https://claude.ai/chat/example',
+                    },
+                },
+            ],
+            artifacts: [
+                {
+                    artifact_id: 'artifact_code_1',
+                    type: 'code_artifact',
+                    title: 'Architecture Mermaid',
+                    mime_type: 'text/plain',
+                    content: 'flowchart TD\n    A --> B',
+                    source_message_id: 'msg_code_1',
+                    exportable: true,
+                },
+            ],
+        };
+
+        const html = renderConversationGraphToHtml(graph);
+
+        expect(html).toContain('<h2>Appendix</h2>');
+        expect(html).toContain('Architecture Mermaid');
+        expect(html).toContain('flowchart TD');
+        expect(html).toContain('See appendix:');
+    });
+
     it('suppresses deep research external links when body content exists', () => {
         const graph: ConversationGraph = {
             conversation_id: 'conv_5',

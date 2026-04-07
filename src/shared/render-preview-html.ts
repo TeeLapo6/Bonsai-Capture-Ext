@@ -96,6 +96,57 @@ const PREVIEW_STYLES = `<style data-bonsai-preview-styles="true">
 .bonsai-deep-research a {
     word-break: break-word;
 }
+
+.bonsai-artifact-index {
+    margin: 0.8rem 0;
+    padding: 0.6rem 1rem;
+    border: 1px solid #dbe4ee;
+    border-radius: 10px;
+    background: #f8fafc;
+    font-size: 0.92rem;
+}
+
+.bonsai-artifact-index summary {
+    cursor: pointer;
+    padding: 0.15rem 0;
+    list-style: none;
+    user-select: none;
+}
+
+.bonsai-artifact-index summary::marker,
+.bonsai-artifact-index summary::-webkit-details-marker {
+    display: none;
+}
+
+.bonsai-artifact-index summary::before {
+    content: '▶';
+    font-size: 0.7rem;
+    margin-right: 0.4rem;
+    transition: transform 0.15s;
+    display: inline-block;
+}
+
+.bonsai-artifact-index[open] summary::before {
+    transform: rotate(90deg);
+}
+
+.bonsai-artifact-index ol {
+    margin: 0.5rem 0 0.2rem;
+    padding-left: 1.6rem;
+}
+
+.bonsai-artifact-index li {
+    margin: 0.25rem 0;
+}
+
+.bonsai-artifact-index a {
+    color: #1d4ed8;
+    text-decoration: none;
+}
+
+.bonsai-artifact-index a:hover {
+    text-decoration: underline;
+}
 </style>`;
 
 function escapeHtml(value: string): string {
@@ -223,6 +274,10 @@ function getArtifactDownloadName(artifact: ArtifactNode): string {
 }
 
 function shouldRenderArtifactInAppendix(artifact: ArtifactNode): boolean {
+    if (artifact.type === 'code_artifact') {
+        return typeof artifact.content === 'string' && artifact.content.trim().length > 0;
+    }
+
     if (artifact.type === 'deep_research' || artifact.type === 'file') {
         return true;
     }
@@ -454,6 +509,14 @@ export function renderConversationGraphToHtml(graph: ConversationGraph): string 
         const provider = graph.provenance.provider ?? 'unknown';
         const model = graph.provenance.model ? ` (${escapeHtml(graph.provenance.model)})` : '';
         html += `<p><strong>Provider:</strong> ${escapeHtml(provider)}${model} [${escapeHtml(graph.provenance.confidence)}]</p>`;
+    }
+
+    if (graph.artifacts.length > 0) {
+        html += '<details class="bonsai-artifact-index"><summary><strong>Artifacts</strong></summary><ol>';
+        graph.artifacts.forEach((artifact) => {
+            html += `<li><a href="#artifact-${escapeAttribute(artifact.artifact_id)}">${escapeHtml(artifact.title ?? artifact.type)}</a></li>`;
+        });
+        html += '</ol></details>';
     }
 
     html += '<hr>';

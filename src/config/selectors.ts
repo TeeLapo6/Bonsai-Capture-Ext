@@ -88,21 +88,21 @@ export const PROVIDER_SELECTORS: Record<string, ProviderSelectors> = {
     submitButton: 'button[aria-label="Send message"]'
   },
   'grok.com': {
-    conversationContainer: '.chat-container, [data-testid="chat"]',
-    messageBlock: '.message, [data-testid="message-container"]',
+    conversationContainer: 'main, [data-testid="chat"], .w-full.h-full.overflow-y-auto.overflow-x-hidden.scrollbar-gutter-stable.flex.flex-col.items-center',
+    messageBlock: 'div.message-bubble, .message, [data-testid="message-container"]',
     roleClassUser: 'user-message',
     roleClassAssistant: 'assistant-message, grok-message',
-    codeBlock: 'pre code, .code-snippet',
+    codeBlock: 'pre code, .code-snippet, code',
     codeLanguage: '.language-label',
     inputField: 'textarea, [contenteditable="true"]',
     submitButton: 'button[type="submit"], [data-testid="send-button"]'
   },
   'jules.google.com': {
     // Jules is TASK-BASED, not chat-based
-    conversationContainer: '.tasks-container, .source-content, [class*="tasks-"], main',
-    messageBlock: '.task-container, .task-description, [class*="task-"]',
+    conversationContainer: 'main, [role="main"]',
+    messageBlock: '.task-container, [data-user], [data-task]',
     roleClassUser: 'user-task, [data-user]',
-    roleClassAssistant: 'jules-task, .task-icon, [data-task], .task-description',
+    roleClassAssistant: 'jules-task, .task-icon, [data-task]',
     codeBlock: 'pre code, code-block, .code-block',
     codeLanguage: '.language-label, [data-language]',
     artifactPanel: '.artifact-panel, [data-testid="artifact"]',

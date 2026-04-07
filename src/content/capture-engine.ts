@@ -7,6 +7,10 @@
 import { ProviderRegistry } from './adapters/factory';
 import type { ProviderAdapter } from './adapters/interface';
 import type { ConversationGraph, CaptureScope, MessageNode, ArtifactNode } from '../shared/schema';
+import {
+    normalizeProviderCaptureSettings,
+    type ProviderCaptureSettings,
+} from '../shared/capture-settings';
 
 export class CaptureEngine {
     private _adapter: ProviderAdapter | null = null;
@@ -28,7 +32,7 @@ export class CaptureEngine {
      * @deprecated Use lazy initialization via adapter getter
      */
     init(): boolean {
-        this._adapter = (window as any).__bonsaiAdapter ?? null;
+        this._adapter = (window as any).__bonsaiAdapter ?? ProviderRegistry.getAdapter(window.location.hostname);
         this._initialized = true;
         return this._adapter !== null;
     }
@@ -54,6 +58,17 @@ export class CaptureEngine {
     setAdapter(adapter: ProviderAdapter) {
         this._adapter = adapter;
         this._initialized = true;
+    }
+
+    /**
+     * Apply provider-specific capture settings to the active adapter.
+     */
+    applyProviderCaptureSettings(settings?: Partial<ProviderCaptureSettings> | null) {
+        if (!this.adapter) {
+            return;
+        }
+
+        this.adapter.setCaptureSettings(normalizeProviderCaptureSettings(settings));
     }
 
     /**
@@ -92,7 +107,7 @@ export class CaptureEngine {
         return (await this.adapter?.captureConversation()) ?? null;
     }
 
-    private async captureGeminiSingleMessage(messageId: string): Promise<ConversationGraph | null> {
+    private async captureScopedSingleMessage(messageId: string): Promise<ConversationGraph | null> {
         if (!this.adapter) {
             return null;
         }
@@ -140,6 +155,11 @@ export class CaptureEngine {
             };
         });
 
+        const referenceBlock = (this.adapter as any).createArtifactReferenceBlock?.(scopedArtifacts);
+        if (referenceBlock) {
+            selectedMessage.content_blocks.push(referenceBlock);
+        }
+
         return {
             conversation_id: crypto.randomUUID(),
             title: conversation.title,
@@ -159,10 +179,10 @@ export class CaptureEngine {
      * Capture a single message.
      */
     async captureSingleMessage(messageId: string): Promise<ConversationGraph | null> {
-        if (this.adapter?.providerSite === 'gemini.google.com') {
-            const scopedGeminiCapture = await this.captureGeminiSingleMessage(messageId);
-            if (scopedGeminiCapture) {
-                return scopedGeminiCapture;
+        if (this.adapter?.providerSite === 'gemini.google.com' || this.adapter?.providerSite === 'claude.ai') {
+            const scopedCapture = await this.captureScopedSingleMessage(messageId);
+            if (scopedCapture) {
+                return scopedCapture;
             }
         }
 
@@ -281,6 +301,7 @@ export class CaptureEngine {
         site: string | null;
         hasConversation: boolean;
         messageCount: number;
+        artifactCount: number;
         provenance: { provider?: string; model?: string; confidence: string } | null;
     } {
         if (!this.adapter) {
@@ -289,6 +310,7 @@ export class CaptureEngine {
                 site: null,
                 hasConversation: false,
                 messageCount: 0,
+                artifactCount: 0,
                 provenance: null
             };
         }
@@ -300,6 +322,7 @@ export class CaptureEngine {
             site: this.adapter.providerSite,
             hasConversation: conversation !== null,
             messageCount: this.adapter.listMessages().length,
+            artifactCount: this.adapter.getArtifactCount(),
             provenance: this.adapter.getProvenance()
         };
     }

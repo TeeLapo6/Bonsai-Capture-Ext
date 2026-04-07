@@ -194,7 +194,10 @@ export class DOMInjector {
             messages = adapter.listMessages();
         }
 
-        if (!messages || messages.length === 0) {
+        // Only use raw selector fallback when no custom adapter is registered.
+        // For providers with an adapter (e.g. Jules), raw selectors can hit unintended
+        // elements (sidebar rows, etc.) and the observer will retry on DOM mutations.
+        if ((!messages || messages.length === 0) && !adapter) {
             messages = queryAllWithFallbacks(document, selectors.messageBlock);
         }
 
@@ -260,6 +263,17 @@ export class DOMInjector {
     private findActionBar(messageEl: Element): Element {
         // FORCE BOTTOM PLACEMENT FOR CLAUDE
         if (this.hostname.includes('claude.ai')) {
+            return this.createFallbackContainer(messageEl);
+        }
+
+        if (this.hostname.includes('jules.google.com')) {
+            return this.createFallbackContainer(messageEl);
+        }
+
+        // GROK: .action-buttons is a sibling of message-bubble, not a descendant
+        if (this.hostname.includes('grok.com')) {
+            const actionButtons = messageEl.parentElement?.querySelector('.action-buttons');
+            if (actionButtons) return actionButtons;
             return this.createFallbackContainer(messageEl);
         }
 

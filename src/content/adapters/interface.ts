@@ -13,6 +13,7 @@ import type {
     ConversationGraph,
     ContentBlock
 } from '../../shared/schema';
+import type { ProviderCaptureSettings } from '../../shared/capture-settings';
 import { createMarkdownBlock } from '../../shared/schema';
 
 export interface SidebarItem {
@@ -118,6 +119,16 @@ export interface ProviderAdapter {
      * Load a conversation by ID/URL.
      */
     loadConversation(id: string): Promise<boolean>;
+
+    /**
+     * Apply provider-specific capture settings from the sidepanel.
+     */
+    setCaptureSettings(settings: ProviderCaptureSettings): void;
+
+    /**
+     * Count visible artifact references for lightweight diagnostics.
+     */
+    getArtifactCount(): number;
 }
 
 /**
@@ -143,21 +154,80 @@ export abstract class BaseAdapter implements ProviderAdapter {
         return false;
     }
 
+    setCaptureSettings(_settings: ProviderCaptureSettings): void {
+        // Default no-op for adapters without provider-specific capture settings.
+    }
+
+    getArtifactCount(): number {
+        return 0;
+    }
+
     protected async parseVisibleArtifacts(): Promise<ArtifactNode[]> {
         return [];
     }
 
     protected getArtifactDedupKey(artifact: ArtifactNode): string {
+        const normalizedTitle = this.cleanArtifactText(artifact.title ?? '').toLowerCase();
         const content = typeof artifact.content === 'string'
-            ? artifact.content.slice(0, 500)
-            : JSON.stringify(artifact.content).slice(0, 500);
+            ? artifact.content.slice(0, 1200)
+            : JSON.stringify(artifact.content).slice(0, 1200);
+        const contentText = typeof artifact.content === 'string'
+            ? this.cleanArtifactText(artifact.content.replace(/<[^>]+>/g, ' '))
+            : '';
+        const hasSubstantialCapturedContent = contentText.length >= 80;
+
+        // Prefer content-first deduping when we captured meaningful inline content so
+        // opener-based and visible-panel-based captures of the same artifact collapse
+        // even if only one path exposed a download/view URL.
+        if (artifact.type === 'code_artifact' || hasSubstantialCapturedContent) {
+            return [
+                artifact.type,
+                normalizedTitle,
+                content,
+            ].join('|');
+        }
 
         return [
             artifact.type,
-            artifact.title ?? '',
+            normalizedTitle,
             artifact.view_url ?? '',
             artifact.source_url ?? '',
             content,
+        ].join('|');
+    }
+
+    protected getArtifactSemanticSignature(artifact: ArtifactNode): string | null {
+        if (artifact.type === 'image' || artifact.type === 'file') {
+            return null;
+        }
+
+        if (typeof artifact.content !== 'string') {
+            return null;
+        }
+
+        const normalizedTitle = this.cleanArtifactText(artifact.title ?? '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+        const decodedContent = artifact.content
+            .replace(/&nbsp;/gi, ' ')
+            .replace(/&lt;/gi, '<')
+            .replace(/&gt;/gi, '>')
+            .replace(/&amp;/gi, '&')
+            .replace(/&quot;/gi, '"')
+            .replace(/&#39;/gi, "'");
+        const normalizedText = this.cleanArtifactText(decodedContent.replace(/<[^>]+>/g, ' '))
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+
+        if (normalizedText.length < 12) {
+            return null;
+        }
+
+        return [
+            normalizedTitle,
+            normalizedText.slice(0, 1200),
         ].join('|');
     }
 
@@ -167,6 +237,10 @@ export abstract class BaseAdapter implements ProviderAdapter {
         }
 
         const appendixArtifacts = artifacts.filter((artifact) => {
+            if (artifact.type === 'code_artifact') {
+                return typeof artifact.content === 'string' && artifact.content.trim().length > 0;
+            }
+
             if (artifact.type === 'deep_research' || artifact.type === 'file') {
                 return true;
             }
@@ -760,7 +834,12 @@ export abstract class BaseAdapter implements ProviderAdapter {
         };
 
         const artifactsByMessageId = new Map<string, ArtifactNode[]>();
-        const seenArtifactKeys = new Set<string>();
+        // Maps dedup key → the canonical ArtifactNode already in graph.artifacts.
+        // When a later message references the same artifact content, we cross-link the
+        // EXISTING artifact_id into that message's artifact_ids rather than silently
+        // discarding the reference (which broke single-message capture for artifact edits).
+        const seenArtifactKeyToArtifact = new Map<string, ArtifactNode>();
+        const seenArtifactSignatureToArtifact = new Map<string, ArtifactNode>();
 
         const attachArtifacts = (message: MessageNode, artifacts: ArtifactNode[]) => {
             if (artifacts.length === 0) {
@@ -772,11 +851,23 @@ export abstract class BaseAdapter implements ProviderAdapter {
 
             artifacts.forEach((artifact) => {
                 const dedupeKey = this.getArtifactDedupKey(artifact);
-                if (seenArtifactKeys.has(dedupeKey)) {
+                const semanticSignature = this.getArtifactSemanticSignature(artifact);
+                const existingArtifact = seenArtifactKeyToArtifact.get(dedupeKey)
+                    ?? (semanticSignature ? seenArtifactSignatureToArtifact.get(semanticSignature) : undefined);
+                if (existingArtifact) {
+                    // Artifact already in graph — cross-reference this message to it so that
+                    // single-message capture (which filters by artifact_ids) can find it.
+                    if (!message.artifact_ids.includes(existingArtifact.artifact_id)) {
+                        message.artifact_ids.push(existingArtifact.artifact_id);
+                        messageArtifacts.push(existingArtifact);
+                    }
                     return;
                 }
 
-                seenArtifactKeys.add(dedupeKey);
+                seenArtifactKeyToArtifact.set(dedupeKey, artifact);
+                if (semanticSignature) {
+                    seenArtifactSignatureToArtifact.set(semanticSignature, artifact);
+                }
                 artifact.source_message_id = message.message_id;
                 message.artifact_ids.push(artifact.artifact_id);
                 graph.artifacts.push(artifact);
@@ -785,15 +876,34 @@ export abstract class BaseAdapter implements ProviderAdapter {
         };
 
         for (const [index, el] of messages.entries()) {
-            const message = await this.parseMessage(el, index);
-            const artifacts = await this.parseArtifacts(el);
+            let message: MessageNode;
+
+            try {
+                message = await this.parseMessage(el, index);
+            } catch (error) {
+                console.warn(`[Bonsai Capture] Failed to parse message ${index} for ${this.providerSite}`, error);
+                continue;
+            }
+
+            let artifacts: ArtifactNode[] = [];
+            try {
+                artifacts = await this.parseArtifacts(el);
+            } catch (error) {
+                console.warn(`[Bonsai Capture] Failed to parse artifacts for message ${index} on ${this.providerSite}`, error);
+            }
 
             attachArtifacts(message, artifacts);
 
             graph.messages.push(message);
         }
 
-        const visibleArtifacts = await this.parseVisibleArtifacts();
+        let visibleArtifacts: ArtifactNode[] = [];
+        try {
+            visibleArtifacts = await this.parseVisibleArtifacts();
+        } catch (error) {
+            console.warn(`[Bonsai Capture] Failed to parse visible artifacts on ${this.providerSite}`, error);
+        }
+
         const targetMessage = [...graph.messages].reverse().find((message) => message.role === 'assistant')
             ?? graph.messages[graph.messages.length - 1];
 

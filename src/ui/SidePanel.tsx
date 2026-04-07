@@ -24,6 +24,11 @@ import { exportToJSON } from '../shared/exporters/json';
 import { exportToTOONString } from '../shared/exporters/toon';
 import { markdownToHtml } from '../shared/markdown-to-html';
 import { renderConversationGraphToHtml } from '../shared/render-preview-html';
+import {
+    DEFAULT_PROVIDER_CAPTURE_SETTINGS,
+    normalizeProviderCaptureSettings,
+    type ProviderCaptureSettings,
+} from '../shared/capture-settings';
 import bonsaiLogo from '../../../Bonsai-WebUI/src/components/icons/bonsai.png';
 
 import JSZip from 'jszip';
@@ -123,6 +128,7 @@ interface Diagnostics {
     site: string | null;
     hasConversation: boolean;
     messageCount: number;
+    artifactCount: number;
     provenance: { provider?: string; model?: string; confidence: string } | null;
 }
 
@@ -290,6 +296,7 @@ export function SidePanel() {
         return stored === 'light' || stored === 'dark' || stored === 'system' ? stored : 'system';
     });
     const [captureMetadataOptions, setCaptureMetadataOptions] = useState<CaptureMetadataOptions>(DEFAULT_CAPTURE_METADATA_OPTIONS);
+    const [providerCaptureSettings, setProviderCaptureSettings] = useState<ProviderCaptureSettings>(() => normalizeProviderCaptureSettings(DEFAULT_PROVIDER_CAPTURE_SETTINGS));
     const captureSearchInputRef = useRef<HTMLInputElement | null>(null);
     const lastCaptureSearchQueryRef = useRef('');
     const [findStats, setFindStats] = useState<{ current: number; total: number } | null>(null);
@@ -538,7 +545,7 @@ export function SidePanel() {
 
     // Load captures from storage
     useEffect(() => {
-        chrome.storage.local.get(['captures', 'insertMode', 'captureMetadataOptions'], (result) => {
+        chrome.storage.local.get(['captures', 'insertMode', 'captureMetadataOptions', 'providerCaptureSettings'], (result) => {
             setCaptures(result.captures ?? []);
             if (result.insertMode) setInsertMode(result.insertMode);
             if (result.captureMetadataOptions) {
@@ -547,12 +554,17 @@ export function SidePanel() {
                     ...result.captureMetadataOptions
                 });
             }
+            setProviderCaptureSettings(normalizeProviderCaptureSettings(result.providerCaptureSettings));
         });
     }, []);
 
     useEffect(() => {
         chrome.storage.local.set({ captureMetadataOptions });
     }, [captureMetadataOptions]);
+
+    useEffect(() => {
+        chrome.storage.local.set({ providerCaptureSettings });
+    }, [providerCaptureSettings]);
 
     useEffect(() => {
         applyThemePreference(themePreference);
@@ -593,6 +605,16 @@ export function SidePanel() {
         chrome.storage.local.set({ insertMode: mode });
         setShowCaptureMenu(false);
     };
+
+    const handleClaudeCaptureSettingsChange = useCallback((updates: Partial<ProviderCaptureSettings['claude']>) => {
+        setProviderCaptureSettings((prev) => normalizeProviderCaptureSettings({
+            ...prev,
+            claude: {
+                ...prev.claude,
+                ...updates,
+            },
+        }));
+    }, []);
 
     // Get diagnostics from content script
     useEffect(() => {
@@ -641,6 +663,7 @@ export function SidePanel() {
                     const response = await chrome.tabs.sendMessage(tab.id, {
                         type: 'CAPTURE',
                         scope: insertMode,
+                        providerCaptureSettings,
                         messageId: message.messageId,
                         messageIndex: message.messageIndex
                     });
@@ -662,7 +685,7 @@ export function SidePanel() {
 
         chrome.runtime.onMessage.addListener(handleMessage);
         return () => chrome.runtime.onMessage.removeListener(handleMessage);
-    }, [insertMode, addToHistory, applyCaptureMetadataOptions, loadCaptureIntoEditor]);
+    }, [insertMode, providerCaptureSettings, addToHistory, applyCaptureMetadataOptions, loadCaptureIntoEditor]);
 
     // Paste captured content into the focused element on the active page
     const handlePaste = useCallback(async () => {
@@ -689,7 +712,8 @@ export function SidePanel() {
 
             const response = await chrome.tabs.sendMessage(tab.id, {
                 type: 'CAPTURE',
-                scope: 'entire'
+                scope: 'entire',
+                providerCaptureSettings,
             });
 
             if (response?.data) {
@@ -700,7 +724,7 @@ export function SidePanel() {
         } catch (e) {
             console.error('Capture failed:', e);
         }
-    }, [addToHistory, applyCaptureMetadataOptions, loadCaptureIntoEditor]);
+    }, [providerCaptureSettings, addToHistory, applyCaptureMetadataOptions, loadCaptureIntoEditor]);
 
     // Export handlers
     const handleExport = useCallback((format: string) => {
@@ -789,7 +813,11 @@ export function SidePanel() {
 
                 if (!isBulkCapturingRef.current) break;
 
-                const response = await chrome.tabs.sendMessage(tab.id, { type: 'CAPTURE', scope: 'entire' });
+                const response = await chrome.tabs.sendMessage(tab.id, {
+                    type: 'CAPTURE',
+                    scope: 'entire',
+                    providerCaptureSettings,
+                });
 
                 if (response && response.data) {
                     const graph = applyCaptureMetadataOptions(response.data as ConversationGraph);
@@ -855,6 +883,8 @@ export function SidePanel() {
             [key]: !prev[key]
         }));
     };
+
+    const isClaudeProvider = diagnostics?.site === 'claude.ai' || diagnostics?.provider === 'Anthropic';
 
     const handleInsertToEditor = useCallback((item: CapturedItem) => {
         if (!editor) return;
@@ -1047,14 +1077,18 @@ export function SidePanel() {
                                         </div>
                                     </div>
                                     <div className="diagnostics-row">
-                                        <span className="label">Messages</span>
-                                        <span className="value">{diagnostics.messageCount}</span>
-                                    </div>
-                                    <div className="diagnostics-row">
                                         <span className="label">Model</span>
                                         <span className={`value ${diagnostics.provenance?.confidence === 'observed' ? 'success' : 'warning'}`}>
                                             {diagnostics.provenance?.model ?? 'Unknown'}
                                         </span>
+                                    </div>
+                                    <div className="diagnostics-row">
+                                        <span className="label">Messages</span>
+                                        <span className="value">{diagnostics.messageCount}</span>
+                                    </div>
+                                    <div className="diagnostics-row">
+                                        <span className="label">Artifacts</span>
+                                        <span className="value">{diagnostics.artifactCount ?? 0}</span>
                                     </div>
                                 </>
                             ) : (
@@ -1128,6 +1162,40 @@ export function SidePanel() {
                                                 Applies to inline insert, Capture All, and Bulk captures. The capture header keeps the conversation timestamp and provider.
                             </div>
                         </div>
+
+                        {isClaudeProvider && (
+                            <div className="capture-metadata-panel">
+                                <div className="capture-metadata-title">Claude Artifact Capture</div>
+                                <label className="capture-provider-setting">
+                                    <span className="capture-provider-setting-label">XPath</span>
+                                    <input
+                                        className="input"
+                                        type="text"
+                                        value={providerCaptureSettings.claude.xPath}
+                                        onChange={(event) => handleClaudeCaptureSettingsChange({ xPath: event.target.value })}
+                                        spellCheck={false}
+                                    />
+                                </label>
+                                <label className="capture-provider-setting">
+                                    <span className="capture-provider-setting-label">Delay Before Panel Capture (ms)</span>
+                                    <input
+                                        className="input"
+                                        type="number"
+                                        min={0}
+                                        step={50}
+                                        value={providerCaptureSettings.claude.panelCaptureDelayMs}
+                                        onChange={(event) => handleClaudeCaptureSettingsChange({
+                                            panelCaptureDelayMs: Number.isFinite(event.target.valueAsNumber)
+                                                ? event.target.valueAsNumber
+                                                : DEFAULT_PROVIDER_CAPTURE_SETTINGS.claude.panelCaptureDelayMs,
+                                        })}
+                                    />
+                                </label>
+                                <div className="capture-metadata-hint">
+                                    Claude document artifacts use this XPath first, then fall back to the visible panel DOM. These settings apply to inline insert, Capture All, and bulk capture.
+                                </div>
+                            </div>
+                        )}
 
                         {/* Actions */}
                         <div className="capture-actions">

@@ -65,6 +65,82 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ success: true });
     }
 
+    if (message.type === 'INSTALL_CLAUDE_CLIPBOARD_INTERCEPTOR') {
+        (async () => {
+            if (!sender.tab?.id) {
+                sendResponse({ success: false, error: 'Missing sender tab id' });
+                return;
+            }
+
+            try {
+                const results = await chrome.scripting.executeScript({
+                    target: {
+                        tabId: sender.tab.id,
+                        frameIds: typeof sender.frameId === 'number' ? [sender.frameId] : undefined,
+                    },
+                    world: 'MAIN',
+                    func: (eventName: string) => {
+                        const globalObject = window as Window & {
+                            __bonsaiClaudeClipboardInterceptorInstalled?: boolean;
+                        };
+
+                        if (globalObject.__bonsaiClaudeClipboardInterceptorInstalled) {
+                            return true;
+                        }
+
+                        const clipboard = navigator.clipboard;
+                        if (!clipboard || typeof clipboard.writeText !== 'function') {
+                            return false;
+                        }
+
+                        const originalWriteText = clipboard.writeText.bind(clipboard);
+                        const clipboardRecord = clipboard as unknown as {
+                            writeText: (text: string) => Promise<void>;
+                        };
+                        const wrappedWriteText = async (text: string) => {
+                            try {
+                                window.dispatchEvent(new CustomEvent(eventName, {
+                                    detail: typeof text === 'string' ? text : String(text ?? ''),
+                                }));
+                            } catch {
+                                // Ignore event-bridge failures and still preserve the original copy behavior.
+                            }
+
+                            return originalWriteText(text);
+                        };
+
+                        try {
+                            clipboardRecord.writeText = wrappedWriteText;
+                        } catch {
+                            try {
+                                Object.defineProperty(clipboard, 'writeText', {
+                                    configurable: true,
+                                    value: wrappedWriteText,
+                                });
+                            } catch {
+                                return false;
+                            }
+                        }
+
+                        globalObject.__bonsaiClaudeClipboardInterceptorInstalled = true;
+                        return true;
+                    },
+                    args: [typeof message.eventName === 'string' ? message.eventName : 'bonsai:claude-artifact-copy'],
+                });
+
+                sendResponse({
+                    success: Boolean(results[0]?.result),
+                });
+            } catch (error) {
+                sendResponse({
+                    success: false,
+                    error: String(error),
+                });
+            }
+        })();
+        return true;
+    }
+
     if (message.type === 'FETCH_IMAGE_BLOB') {
         (async () => {
             const logs: string[] = [];
