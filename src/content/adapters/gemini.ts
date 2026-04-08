@@ -170,6 +170,16 @@ export class GeminiAdapter extends BaseAdapter {
             return true;
         }
 
+        // Check for video elements without requiring them to be fully rendered/visible yet.
+        // getGeminiVideoCandidates() filters by isVisibleElement() which needs non-zero
+        // dimensions — a video that just landed in the DOM may still have zero dimensions
+        // while its metadata loads or its CSS layout is calculated.
+        const hasVideoEl = Array.from(el.querySelectorAll('video, source[type^="video/"]'))
+            .some((v) => !this.isGeminiArtifactScopedElement(v));
+        if (hasVideoEl) {
+            return true;
+        }
+
         if (el.querySelector('code-block, pre, img, deep-research-confirmation-widget, deep-research-entry-chip-content, table-block')) {
             return true;
         }
@@ -240,6 +250,12 @@ export class GeminiAdapter extends BaseAdapter {
                         'immersive-entry-chip', 'immersive-entry-chip-content',
                         'deep-research-entry-chip-content', 'deep-research-confirmation-widget',
                         '[data-test-id="container"]',
+                        // Gemini videos should be rendered via artifact sections, not inline prose HTML.
+                        'video', 'source',
+                        'a[href*="googlevideo.com"]',
+                        'a[href*="video.googleusercontent.com"]',
+                        'a[aria-label*="video" i]',
+                        '[data-test-id*="video"]',
                     ]
                 });
 
@@ -524,7 +540,8 @@ export class GeminiAdapter extends BaseAdapter {
                 }
 
                 const text = this.cleanArtifactText(candidate.textContent?.replace(/\s+/g, ' ').trim() ?? '');
-                return text.length > 80;
+                return text.length > 80
+                    || candidate.querySelector('video, source[type^="video/"], iframe[src*="googlevideo"], [data-test-id*="video"]') !== null;
             });
 
         if (!expectedTitle) {
@@ -552,6 +569,268 @@ export class GeminiAdapter extends BaseAdapter {
         }
 
         return (panelRoot.querySelector('immersive-editor, .markdown-main-panel, .markdown, response-container, div[contenteditable="true"]') ?? panelRoot) as Element;
+    }
+
+    private getVideoSourceCandidate(el: Element): string | null {
+        if (el instanceof HTMLVideoElement) {
+            return el.currentSrc || el.src || el.getAttribute('src');
+        }
+
+        const directSource = el.getAttribute('src')
+            ?? el.getAttribute('data-src')
+            ?? el.getAttribute('data-url')
+            ?? el.getAttribute('href');
+        if (directSource) {
+            return directSource;
+        }
+
+        const sourceEl = el.querySelector('source[src], video[src], [data-src], [data-url], a[href]');
+        if (sourceEl instanceof Element) {
+            return sourceEl.getAttribute('src')
+                ?? sourceEl.getAttribute('data-src')
+                ?? sourceEl.getAttribute('data-url')
+                ?? sourceEl.getAttribute('href');
+        }
+
+        return null;
+    }
+
+    private inferVideoMimeType(container: Element, fallbackUrl?: string | null): string {
+        const sourceType = container.querySelector('source[type], video[type]')?.getAttribute('type')?.trim();
+        if (sourceType && sourceType.startsWith('video/')) {
+            return sourceType;
+        }
+
+        const videoType = container.getAttribute('type')?.trim();
+        if (videoType && videoType.startsWith('video/')) {
+            return videoType;
+        }
+
+        const sourceUrl = fallbackUrl ?? this.getVideoSourceCandidate(container);
+        if (sourceUrl) {
+            const lower = sourceUrl.toLowerCase();
+            if (lower.includes('.webm')) return 'video/webm';
+            if (lower.includes('.mov') || lower.includes('.qt')) return 'video/quicktime';
+            if (lower.includes('.m3u8')) return 'application/vnd.apple.mpegurl';
+        }
+
+        return 'video/mp4';
+    }
+
+    private async urlToDataUrl(url: string): Promise<string | null> {
+        try {
+            const response = await fetch(url, { credentials: 'include' });
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+
+            const blob = await response.blob();
+            return await new Promise<string>((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result as string);
+                reader.onerror = reject;
+                reader.readAsDataURL(blob);
+            });
+        } catch {
+            return null;
+        }
+    }
+
+    private async pageBlobUrlToDataUrl(url: string): Promise<string | null> {
+        // Route through the background service worker which uses
+        // chrome.scripting.executeScript({ world: 'MAIN' }) to run the fetch() call
+        // inside the page's own JS context. This bypasses the page's CSP (which blocks
+        // <script> injection from content scripts) and the content-script isolation
+        // boundary (content scripts cannot fetch() blob: URLs created by page JS).
+        return await new Promise<string | null>((resolve) => {
+            const timer = window.setTimeout(() => resolve(null), 5000);
+            chrome.runtime.sendMessage(
+                { type: 'FETCH_BLOB_AS_DATA_URL', url },
+                (response: { dataUrl: string | null } | undefined) => {
+                    clearTimeout(timer);
+                    if (chrome.runtime.lastError) {
+                        resolve(null);
+                        return;
+                    }
+                    resolve(response?.dataUrl ?? null);
+                }
+            );
+        });
+    }
+
+    private async videoToCaptureUrl(sourceUrl: string): Promise<string> {
+        if (!sourceUrl || sourceUrl.startsWith('data:')) {
+            return sourceUrl;
+        }
+
+        if (sourceUrl.startsWith('blob:')) {
+            // blob: URLs are page-origin-bound. Route through the background service worker
+            // which executes the fetch() in the MAIN world via chrome.scripting.executeScript.
+            return await this.pageBlobUrlToDataUrl(sourceUrl)
+                ?? await this.urlToDataUrl(sourceUrl)
+                ?? sourceUrl;
+        }
+
+        // HTTPS video URLs from Gemini's CDN (e.g. contribution.usercontent.google.com)
+        // use Google's Related Website Set for CORS so they work on gemini.google.com but fail
+        // when loaded cross-origin from the extension's chrome-extension:// sidepanel origin.
+        // Chrome extensions bypass CORS entirely for hosts they have host_permissions for,
+        // so urlToDataUrl() (which runs in the content-script context) can fetch and convert
+        // the video to a data URL that is always playable in the extension sidepanel.
+        const dataUrl = await this.urlToDataUrl(sourceUrl);
+        return dataUrl ?? sourceUrl;
+    }
+
+    private getGeminiVideoDownloadUrl(root: Element | null): string | null {
+        if (!root) {
+            return null;
+        }
+
+        const candidates = [
+            root,
+            ...Array.from(root.querySelectorAll('a[href], [data-href], [data-url], [data-download-url], [data-download-href], [download]')),
+        ].filter((candidate): candidate is Element => candidate instanceof Element);
+
+        for (const candidate of candidates) {
+            const label = this.cleanArtifactText(
+                candidate.getAttribute('aria-label')
+                    ?? candidate.getAttribute('title')
+                    ?? candidate.textContent
+                    ?? ''
+            ).toLowerCase();
+
+            if (!/\b(download|save|export|get file|get video)\b/.test(label)) {
+                continue;
+            }
+
+            const url = candidate.getAttribute('href')
+                ?? candidate.getAttribute('data-href')
+                ?? candidate.getAttribute('data-url')
+                ?? candidate.getAttribute('data-download-url')
+                ?? candidate.getAttribute('data-download-href');
+
+            if (this.isLikelyGeminiVideoUrl(url)) {
+                return url;
+            }
+        }
+
+        return null;
+    }
+
+    private isLikelyGeminiVideoUrl(url: string | null | undefined): boolean {
+        if (!url) {
+            return false;
+        }
+
+        const normalizedUrl = url.trim().toLowerCase();
+
+        return normalizedUrl.startsWith('data:video/')
+            || normalizedUrl.startsWith('blob:')
+            || normalizedUrl.includes('.mp4')
+            || normalizedUrl.includes('.webm')
+            || normalizedUrl.includes('.mov')
+            || normalizedUrl.includes('.m3u8')
+            || normalizedUrl.includes('googlevideo.com')
+            || normalizedUrl.includes('video.googleusercontent.com')
+            || normalizedUrl.includes('contribution.usercontent.google.com')
+            || normalizedUrl.includes('youtube.com/embed/')
+            || normalizedUrl.includes('youtube-nocookie.com/embed/');
+    }
+
+    private isGeminiVideoControlCandidate(candidate: Element): boolean {
+        if (candidate.matches('button, [role="button"]')) {
+            return true;
+        }
+
+        const label = this.cleanArtifactText(
+            candidate.getAttribute('aria-label')
+                ?? candidate.getAttribute('title')
+                ?? candidate.textContent
+                ?? ''
+        ).toLowerCase();
+
+        if (!label) {
+            return false;
+        }
+
+        return /^(share|download|play|pause|mute|unmute|copy|save|fullscreen|full screen|replay|seek|scrub|volume|more|options?)\b/.test(label)
+            || /\b(share|download|play|pause|mute|unmute)\s+video\b/.test(label)
+            || /^open\b.*\b(canvas|player|viewer)\b/.test(label);
+    }
+
+    private getGeminiVideoCandidates(root: ParentNode): Element[] {
+        return Array.from(root.querySelectorAll('video, source[src], iframe[src], a[href], [data-src], [data-url]'))
+            .filter((candidate): candidate is Element => candidate instanceof Element)
+            .filter((candidate) => this.isVisibleElement(candidate.matches('source') ? candidate.parentElement ?? candidate : candidate))
+            .filter((candidate) => {
+                if (candidate.matches('video, source[type^="video/"]')) {
+                    return true;
+                }
+
+                const directSource = this.getVideoSourceCandidate(candidate);
+                if (!this.isLikelyGeminiVideoUrl(directSource)) {
+                    return false;
+                }
+
+                return !this.isGeminiVideoControlCandidate(candidate);
+            });
+    }
+
+    private async createGeminiVideoArtifact(candidate: Element, fallbackTitle?: string): Promise<ArtifactNode | null> {
+        const container = candidate.matches('video, source[type^="video/"]')
+            ? candidate.closest('figure, section, article, div, immersive-panel, code-immersive-panel, deep-research-immersive-panel, extended-response-panel, immersive-editor, chat-window, a') ?? candidate
+            : candidate.matches('iframe, a, [data-src], [data-url]')
+                ? candidate
+                : candidate.closest('figure, section, article, div, immersive-panel, code-immersive-panel, deep-research-immersive-panel, extended-response-panel, immersive-editor, chat-window, a') ?? candidate;
+        const panelRoot = candidate.closest('chat-window.immersives-mode, immersive-panel, code-immersive-panel, deep-research-immersive-panel, extended-response-panel, immersive-editor');
+        const directDownloadUrl = this.getGeminiVideoDownloadUrl(container)
+            ?? this.getGeminiVideoDownloadUrl(panelRoot);
+        const rawSourceUrl = this.getVideoSourceCandidate(container)
+            ?? this.getVideoSourceCandidate(candidate)
+            ?? (candidate.matches('iframe') ? candidate.getAttribute('src') : null)
+            ?? this.extractArtifactViewUrl(container)
+            ?? this.extractArtifactViewUrl(candidate)
+            ?? null;
+
+        const { viewUrl: extractedViewUrl, sourceUrl: extractedSourceUrl } = this.extractArtifactLinks(container);
+        const sourceUrl = directDownloadUrl ?? extractedSourceUrl ?? rawSourceUrl;
+        const playbackUrl = [sourceUrl, rawSourceUrl, extractedViewUrl]
+            .find((url) => this.isLikelyGeminiVideoUrl(url))
+            ?? null;
+        const viewUrl = extractedViewUrl ?? sourceUrl ?? rawSourceUrl ?? window.location.href;
+
+        if (!playbackUrl) {
+            return null;
+        }
+
+        const title = this.cleanArtifactText(
+            fallbackTitle
+                || container.getAttribute('aria-label')
+                || candidate.getAttribute('aria-label')
+                || container.getAttribute('title')
+                || candidate.getAttribute('title')
+                || container.querySelector('[data-test-id="artifact-text"], [data-test-id="title"], [data-test-id="title-text"], .title-text, [role="heading"], h1, h2, h3, strong')?.textContent
+                || 'Generated Video'
+        ) || 'Generated Video';
+
+        const content = await this.videoToCaptureUrl(playbackUrl);
+        const mimeType = this.inferVideoMimeType(container, playbackUrl);
+        const resolvedSourceUrl = sourceUrl && !sourceUrl.startsWith('blob:') ? sourceUrl : undefined;
+        const resolvedViewUrl = viewUrl && !viewUrl.startsWith('blob:')
+            ? viewUrl
+            : resolvedSourceUrl ?? window.location.href;
+
+        return {
+            artifact_id: crypto.randomUUID(),
+            type: 'video',
+            title,
+            mime_type: mimeType,
+            content,
+            source_message_id: '',
+            source_url: resolvedSourceUrl,
+            view_url: resolvedViewUrl,
+            exportable: true,
+        };
     }
 
     private parseMonacoLineOffset(line: Element): number | null {
@@ -809,6 +1088,17 @@ export class GeminiAdapter extends BaseAdapter {
             }
 
             const contentRoot = this.getGeminiImmersiveContentRoot(panelRoot);
+            const videoCandidate = this.getGeminiVideoCandidates(panelRoot)[0];
+            if (videoCandidate) {
+                const videoArtifact = await this.createGeminiVideoArtifact(
+                    videoCandidate,
+                    expectedTitle || this.getGeminiPanelTitle(panelRoot)
+                );
+                if (videoArtifact) {
+                    return videoArtifact;
+                }
+            }
+
             const isCodeArtifact = this.isGeminiCodePanel(panelRoot)
                 || root.querySelector('mat-icon[fonticon="code_blocks"], mat-icon[data-mat-icon-name="code_blocks"], [data-mat-icon-name="code_blocks"]') !== null;
 
@@ -910,6 +1200,25 @@ export class GeminiAdapter extends BaseAdapter {
             artifacts.push(artifact);
         }
 
+        for (const candidate of this.getGeminiVideoCandidates(el)) {
+            if (candidate.closest('chat-window.immersives-mode, code-immersive-panel, immersive-panel, deep-research-immersive-panel, extended-response-panel, immersive-editor')) {
+                continue;
+            }
+
+            const artifact = await this.createGeminiVideoArtifact(candidate);
+            if (!artifact) {
+                continue;
+            }
+
+            const dedupeKey = this.getArtifactDedupKey(artifact);
+            if (seenContent.has(dedupeKey)) {
+                continue;
+            }
+
+            seenContent.add(dedupeKey);
+            artifacts.push(artifact);
+        }
+
         const images = el.querySelectorAll('img');
 
         for (const [idx, imgEl] of Array.from(images).entries()) {
@@ -968,6 +1277,26 @@ export class GeminiAdapter extends BaseAdapter {
         ).filter((candidate): candidate is Element => candidate instanceof Element && this.isVisibleElement(candidate));
 
         for (const root of visiblePanels) {
+            const panelVideoCandidates = this.getGeminiVideoCandidates(root);
+            if (panelVideoCandidates.length > 0) {
+                for (const candidate of panelVideoCandidates) {
+                    const artifact = await this.createGeminiVideoArtifact(candidate, this.getGeminiPanelTitle(root));
+                    if (!artifact) {
+                        continue;
+                    }
+
+                    const dedupeKey = this.getArtifactDedupKey(artifact);
+                    if (seenContent.has(dedupeKey)) {
+                        continue;
+                    }
+
+                    seenContent.add(dedupeKey);
+                    artifacts.push(artifact);
+                }
+
+                continue;
+            }
+
             const descriptor = `${root.tagName} ${root.className || ''} ${root.getAttribute('data-test-id') || ''}`.toLowerCase();
             const contentRoot = this.getGeminiImmersiveContentRoot(root);
             const { viewUrl, sourceUrl } = this.extractArtifactLinks(contentRoot);
@@ -1086,6 +1415,25 @@ export class GeminiAdapter extends BaseAdapter {
                 view_url: this.extractArtifactViewUrl(img) ?? window.location.href,
                 exportable: true
             });
+        }
+
+        const visibleVideos = this.getGeminiVideoCandidates(document).filter((candidate) => {
+            return !candidate.closest('code-immersive-panel, immersive-panel, deep-research-immersive-panel, extended-response-panel, immersive-editor');
+        });
+
+        for (const candidate of visibleVideos) {
+            const artifact = await this.createGeminiVideoArtifact(candidate);
+            if (!artifact) {
+                continue;
+            }
+
+            const dedupeKey = this.getArtifactDedupKey(artifact);
+            if (seenContent.has(dedupeKey)) {
+                continue;
+            }
+
+            seenContent.add(dedupeKey);
+            artifacts.push(artifact);
         }
 
         return artifacts;

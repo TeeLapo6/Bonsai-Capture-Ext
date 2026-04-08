@@ -7,7 +7,7 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useEditor, EditorContent } from '@tiptap/react';
-import { Extension } from '@tiptap/core';
+import { Extension, Node as TipTapNode, mergeAttributes } from '@tiptap/core';
 import StarterKit from '@tiptap/starter-kit';
 import Link from '@tiptap/extension-link';
 import Superscript from '@tiptap/extension-superscript';
@@ -131,6 +131,51 @@ interface Diagnostics {
     artifactCount: number;
     provenance: { provider?: string; model?: string; confidence: string } | null;
 }
+
+const BonsaiVideoNode = TipTapNode.create({
+    name: 'bonsaiVideo',
+    group: 'block',
+    atom: true,
+    selectable: true,
+    draggable: true,
+    isolating: true,
+
+    addAttributes() {
+        return {
+            src: {
+                default: null,
+                parseHTML: (element) => element.getAttribute('src'),
+            },
+            title: {
+                default: null,
+                parseHTML: (element) => element.getAttribute('title'),
+            },
+            poster: {
+                default: null,
+                parseHTML: (element) => element.getAttribute('poster'),
+            },
+            preload: {
+                default: 'metadata',
+                parseHTML: (element) => element.getAttribute('preload') ?? 'metadata',
+            },
+        };
+    },
+
+    parseHTML() {
+        return [{ tag: 'video[src]' }];
+    },
+
+    renderHTML({ HTMLAttributes }) {
+        return [
+            'video',
+            mergeAttributes(HTMLAttributes, {
+                controls: '',
+                playsinline: '',
+                preload: HTMLAttributes.preload ?? 'metadata',
+            }),
+        ];
+    },
+});
 
 
 function getTextNodesIn(el: Element): Text[] {
@@ -323,6 +368,7 @@ export function SidePanel() {
                 inline: true,
                 allowBase64: true,
             }),
+            BonsaiVideoNode,
             Placeholder.configure({
                 placeholder: 'Type here or paste text to refine with AI...',
             }),

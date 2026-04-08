@@ -261,6 +261,12 @@ function getArtifactDownloadName(artifact: ArtifactNode): string {
                 return 'json';
             case 'image/svg+xml':
                 return 'svg';
+            case 'video/mp4':
+                return 'mp4';
+            case 'video/webm':
+                return 'webm';
+            case 'video/quicktime':
+                return 'mov';
             default:
                 return 'bin';
         }
@@ -340,6 +346,19 @@ function renderArtifact(artifact: ArtifactNode): string {
 
     if (artifact.type === 'image' && typeof artifact.content === 'string') {
         html += `<p><img src="${escapeAttribute(artifact.content)}" alt="${escapeAttribute(artifact.title ?? 'image')}" /></p>`;
+        html += '</section>';
+        return html;
+    }
+
+    if (artifact.type === 'video' && typeof artifact.content === 'string') {
+        const title = artifact.title ?? 'video';
+        html += `<video controls preload="metadata" playsinline src="${escapeAttribute(artifact.content)}" title="${escapeAttribute(title)}" style="display:block; width:100%; max-height:540px; border-radius:8px; background:#000;"></video>`;
+
+        if (artifact.content.startsWith('data:')) {
+            const downloadName = getArtifactDownloadName(artifact);
+            html += `<p><a href="${escapeAttribute(artifact.content)}" download="${escapeAttribute(downloadName)}">Download captured video</a></p>`;
+        }
+
         html += '</section>';
         return html;
     }

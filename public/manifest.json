@@ -8,6 +8,7 @@
     "scripting",
     "sidePanel",
     "storage",
+    "unlimitedStorage",
     "declarativeNetRequest",
     "clipboardRead"
   ],
@@ -33,6 +34,7 @@
     "https://*.googleusercontent.com/*",
     "https://*.ggpht.com/*",
     "https://*.google.com/*",
+    "https://*.usercontent.google.com/*",
     "https://jules.google.com/*"
   ],
   "background": {

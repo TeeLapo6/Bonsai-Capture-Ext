@@ -12,9 +12,7 @@ const ADAPTERS = {
     'content/claude': 'src/content/adapters/claude.ts',
     'content/gemini': 'src/content/adapters/gemini.ts',
     'content/grok': 'src/content/adapters/grok.ts',
-    'content/bonsai_webui': 'src/content/adapters/bonsai_webui.ts',
-    // Jules is a recent provider; make sure we build its content script
-    'content/jules': 'src/content/adapters/jules.ts'
+    'content/bonsai_webui': 'src/content/adapters/bonsai_webui.ts'
 };
 
 async function buildAll() {

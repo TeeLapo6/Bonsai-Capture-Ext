@@ -391,6 +391,25 @@ export class DOMInjector {
             return container;
         }
 
+        if (this.hostname.includes('gemini.google.com')) {
+            const next = messageEl.nextElementSibling;
+            if (next && next.classList.contains('bonsai-fallback-container')) {
+                return next;
+            }
+
+            const container = document.createElement('div');
+            container.className = 'bonsai-action-container bonsai-fallback-container';
+            container.style.cssText = 'display: flex; justify-content: flex-end; padding: 6px 0 0; margin-bottom: 16px; width: 100%; box-sizing: border-box;';
+
+            if (messageEl.parentNode) {
+                messageEl.parentNode.insertBefore(container, messageEl.nextSibling);
+            } else {
+                messageEl.appendChild(container);
+            }
+
+            return container;
+        }
+
         // Default handling for Assistant / Others (Inside Bottom)
         const existing = messageEl.querySelector('.bonsai-fallback-container');
         if (existing) return existing;

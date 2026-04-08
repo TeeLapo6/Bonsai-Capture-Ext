@@ -91,6 +91,8 @@ function formatMessage(message: MessageNode, artifacts: ArtifactNode[] = []): st
             }
             if (artifact.type === 'image' && typeof artifact.content === 'string') {
                 md += `![${artifact.title ?? 'image'}](${artifact.content})\n\n`;
+            } else if (artifact.type === 'video' && typeof artifact.content === 'string') {
+                md += `<video controls src="${artifact.content}"></video>\n\n`;
             } else if (artifact.type === 'file' && typeof artifact.content === 'string' && artifact.content.startsWith('data:')) {
                 md += `[Captured file included in HTML export: ${artifact.title ?? 'file'}]\n\n`;
             } else if (artifact.type === 'code_artifact' && typeof artifact.content === 'string') {
@@ -170,6 +172,8 @@ export function exportToMarkdown(graph: ConversationGraph): string {
             if (typeof artifact.content === 'string') {
                 if (artifact.type === 'image') {
                     md += `![${artifact.title ?? 'artifact'}](${artifact.content})\n\n`;
+                } else if (artifact.type === 'video') {
+                    md += `<video controls src="${artifact.content}"></video>\n\n`;
                 } else if (artifact.type === 'file' && artifact.content.startsWith('data:')) {
                     md += `[Captured file included in HTML export: ${artifact.title ?? 'file'}]\n\n`;
                 } else if (artifact.type === 'code_artifact') {

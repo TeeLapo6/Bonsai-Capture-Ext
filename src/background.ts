@@ -141,6 +141,53 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true;
     }
 
+    if (message.type === 'FETCH_BLOB_AS_DATA_URL') {
+        // Fetch a page-owned blob: URL by running fetch() in the MAIN world of the
+        // originating tab. This bypasses the page's CSP (which blocks <script> injection)
+        // and the content-script isolation boundary (which prevents content scripts from
+        // accessing blobs created by page JS).
+        (async () => {
+            if (!sender.tab?.id) {
+                sendResponse({ dataUrl: null, error: 'Missing sender tab id' });
+                return;
+            }
+
+            try {
+                const results = await chrome.scripting.executeScript({
+                    target: {
+                        tabId: sender.tab.id,
+                        frameIds: typeof sender.frameId === 'number' ? [sender.frameId] : undefined,
+                    },
+                    world: 'MAIN',
+                    args: [message.url as string],
+                    func: async (blobUrl: string): Promise<string | null> => {
+                        try {
+                            const resp = await fetch(blobUrl);
+                            if (!resp.ok) return null;
+                            const blob = await resp.blob();
+                            return await new Promise<string | null>((resolve) => {
+                                const reader = new FileReader();
+                                reader.onloadend = () => {
+                                    const result = reader.result;
+                                    resolve(typeof result === 'string' ? result : null);
+                                };
+                                reader.onerror = () => resolve(null);
+                                reader.readAsDataURL(blob);
+                            });
+                        } catch {
+                            return null;
+                        }
+                    },
+                });
+
+                sendResponse({ dataUrl: results[0]?.result ?? null });
+            } catch (error) {
+                sendResponse({ dataUrl: null, error: String(error) });
+            }
+        })();
+        return true;
+    }
+
     if (message.type === 'FETCH_IMAGE_BLOB') {
         (async () => {
             const logs: string[] = [];

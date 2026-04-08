@@ -116,6 +116,7 @@ export interface MessageNode {
 
 export type ArtifactType =
     | 'image'
+    | 'video'
     | 'embedded_doc'
     | 'artifact_doc'
     | 'deep_research'

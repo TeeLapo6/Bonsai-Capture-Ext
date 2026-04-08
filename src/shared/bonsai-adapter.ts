@@ -49,7 +49,7 @@ export type ImportMessageContent =
     | { type: 'multimodal'; text?: string; attachments: ImportAttachmentRef[] };
 
 export interface ImportAttachmentRef {
-    attachment_type: 'image' | 'pdf' | 'document' | 'text';
+    attachment_type: 'image' | 'video' | 'pdf' | 'document' | 'text';
     mime_type: string;
     base64?: string;
     url?: string;
@@ -229,9 +229,10 @@ function blockToString(block: ContentBlock): string {
     }
 }
 
-function mapArtifactType(type: string): 'image' | 'pdf' | 'document' | 'text' {
+function mapArtifactType(type: string): 'image' | 'video' | 'pdf' | 'document' | 'text' {
     switch (type) {
         case 'image': return 'image';
+        case 'video': return 'video';
         case 'embedded_doc': return 'pdf'; // Assumption
         case 'file': return 'document';
         default: return 'text';
