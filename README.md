@@ -1,105 +1,108 @@
 # Bonsai Capture
 
-A Chrome extension that captures AI chat conversations from ChatGPT, Claude, Gemini, and Grok, and exports them for import into Bonsai.
+A Chrome extension (Manifest V3) that captures AI chat conversations — including artifacts, images, code, and research outputs — and exports them as structured local files.
+
+**Landing page / install guide:** [https://taylorlaporte.me/Bonsai-Capture/](https://taylorlaporte.me/Bonsai-Capture/)
+
+## Supported providers
+
+| Provider | Conversations | Images | Code artifacts | Deep Research | Video / Canvas |
+|---|---|---|---|---|---|
+| ChatGPT | ✅ | ✅ | ✅ | ✅ | ✅ (Canvas) |
+| Claude | ✅ | ✅ | ✅ | — | ✅ (Canvas) |
+| Gemini | ✅ | ✅ | ✅ | ✅ | ✅ (Immersive) |
+| Grok | ✅ | — | — | — | — |
+| Jules | ✅ | — | ✅ | — | — |
 
 ## Features
 
-- **Universal Capture**: Works with ChatGPT, Claude, Gemini, and Grok
-- **Structured Export**: Captures messages, code blocks, artifacts, and metadata
-- **Multiple Export Formats**: Markdown, JSON, TOON, and Bonsai Import format
-- **Side Panel Editor**: Rich text editor for refining prompts
-- **Send to AI**: Send editor content directly to the chat input
-- **Capture Scopes**: Entire conversation, up to message, or single message
+- **Multi-provider capture** — one extension flow for ChatGPT, Claude, Gemini, Grok, and Jules
+- **Artifact capture** — code artifacts, HTML previews, Claude Canvas, ChatGPT Deep Research, Gemini immersive artifacts, and generated images/video captured alongside the conversation
+- **Capture scopes** — entire conversation, up to a message, this message only, or this message + following
+- **Structured exports** — Markdown, JSON, TOON; YAML frontmatter, code fences, and artifact references preserved
+- **Provenance** — per-message timestamps, provider, model, confidence level, and source links
+- **Bulk capture** — capture and export multiple conversations at once
+- **Side-panel editor** — rich text editor for refining prompts before sending back to the AI
 
-## Development
-
-### Prerequisites
-
-- Node.js 18+
-- npm or bun
-
-### Setup
+## Quick start (load unpacked)
 
 ```bash
-# Install dependencies
+# 1. Install dependencies
 npm install
 
-# Development mode (with hot reload)
-npm run dev
-
-# Build for production
+# 2. Build
 npm run build
 ```
 
-> **Adding new providers/adapters**
-> When you add a new content adapter under `src/content/adapters`, be sure to also update
-> `build.js` so that the script is included in the `ADAPTERS` map. Otherwise the
-> generated `manifest.json` will reference a `.js` file that doesn't exist, leading to
-> "Could not load javascript" errors when loading the unpacked extension.
+Then in Chrome/Brave:
+1. Go to `chrome://extensions`
+2. Enable **Developer mode**
+3. Click **Load unpacked** and select the `dist/` folder
 
+## Development
 
-### Load in Chrome
+```bash
+# Watch mode (rebuilds on save)
+npm run dev
 
-1. Build the extension: `npm run build`
-2. Open Chrome and go to `chrome://extensions`
-3. Enable "Developer mode"
-4. Click "Load unpacked"
-5. Select the `dist/` folder
+# Run unit tests
+npm test
 
-### Project Structure
+# Full test + build
+npm test && npm run build
+```
+
+> **Adding new adapters:** When adding a new content adapter under `src/content/adapters/`, also update `build.js` so the script is included in the `ADAPTERS` map; otherwise the generated `manifest.json` will reference a missing `.js` file.
+
+## Project structure
 
 ```
 src/
-├── background.ts           # Service worker
-├── content/
-│   ├── adapters/           # Provider-specific parsers
-│   │   ├── interface.ts    # Common adapter interface
-│   │   ├── chatgpt.ts      # ChatGPT adapter
-│   │   ├── claude.ts       # Claude adapter
-│   │   ├── gemini.ts       # Gemini adapter
-│   │   └── grok.ts         # Grok adapter
-│   └── capture-engine.ts   # Capture orchestration
+├── background.ts              # MV3 service worker
 ├── config/
-│   └── selectors.ts        # Configurable DOM selectors
+│   └── selectors.ts           # Per-provider CSS selectors
+├── content/
+│   ├── adapters/              # Provider-specific parsers
+│   │   ├── interface.ts       # BaseAdapter + ProviderRegistry
+│   │   ├── chatgpt.ts
+│   │   ├── claude.ts
+│   │   ├── gemini.ts
+│   │   ├── grok.ts
+│   │   ├── jules.ts
+│   │   └── bonsai_webui.ts
+│   ├── capture-engine.ts      # Capture orchestration
+│   └── dom-injector.ts        # In-page insert/capture buttons
 ├── shared/
-│   ├── schema.ts           # Canonical ConversationGraph types
-│   ├── bonsai-adapter.ts   # Bonsai import format
+│   ├── schema.ts              # ConversationGraph canonical types
 │   └── exporters/
-│       ├── markdown.ts     # Markdown export
-│       ├── json.ts         # JSON export
-│       └── toon.ts         # TOON format export
+│       ├── markdown.ts
+│       ├── json.ts
+│       └── toon.ts
 └── ui/
-    ├── main.tsx            # React entry point
-    ├── SidePanel.tsx       # Main UI component
-    └── styles.css          # Styling
+    ├── SidePanel.tsx          # Main React UI (tabs: Capture, History, Export, Bulk)
+    └── styles.css
 ```
 
-## Canonical Schema
+## Canonical schema
 
-The extension uses a `ConversationGraph` schema that captures:
+All captures produce a `ConversationGraph` that includes:
 
-- **Messages**: Role, sequence, content blocks, artifacts
-- **Content Blocks**: Text, markdown, code (with language), images, tables, lists
-- **Artifacts**: Embedded docs, images, code artifacts, deep research outputs
-- **Provenance**: Provider, model, confidence level
+- **MessageNode** — role, sequence, content blocks, artifact IDs, deep link, provenance
+- **ContentBlock** — `markdown` | `text` | `code` | `html` | `image_ref` | `table` | `list`
+- **ArtifactNode** — `image` | `embedded_doc` | `artifact_doc` | `code_artifact` | `deep_research` | `file` | `canvas`
+- **Provenance** — provider, model, confidence (`observed` | `inferred` | `unknown`)
 
-## Export Formats
+## Export formats
 
-### Markdown
-Human-readable format with role headers, code fences, and embedded artifacts.
+| Format | Description |
+|---|---|
+| **Markdown** | Human-readable; role headers, code fences, YAML frontmatter |
+| **JSON** | Full `ConversationGraph` serialization |
+| **TOON** | Extended node-graph format for branching/evaluation workflows |
 
-### JSON
-Full `ConversationGraph` serialization for programmatic access.
+## Updating selectors
 
-### TOON
-Extended format with node mappings for branching support.
-
-### Bonsai Import
-Ready for import into Bonsai with message/attachment mapping.
-
-## Updating Selectors
-
-When chat UIs change, update `src/config/selectors.ts` with new CSS selectors per provider. The adapters use these centralized selectors instead of hardcoding.
+When a provider's UI changes, update `src/config/selectors.ts`. Adapters read selectors from there rather than hardcoding them.
 
 ## License
 
