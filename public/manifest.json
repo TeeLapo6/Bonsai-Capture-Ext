@@ -34,8 +34,7 @@
     "https://*.googleusercontent.com/*",
     "https://*.ggpht.com/*",
     "https://*.google.com/*",
-    "https://*.usercontent.google.com/*",
-    "https://jules.google.com/*"
+    "https://*.usercontent.google.com/*"
   ],
   "background": {
     "service_worker": "background.js",
@@ -108,15 +107,6 @@
         "content/bonsai_webui.js"
       ],
       "run_at": "document_start"
-    },
-    {
-      "matches": [
-        "https://jules.google.com/*"
-      ],
-      "js": [
-        "content/jules.js"
-      ],
-      "run_at": "document_idle"
     }
   ],
   "action": {
