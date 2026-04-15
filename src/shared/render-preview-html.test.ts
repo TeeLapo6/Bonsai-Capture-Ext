@@ -524,4 +524,63 @@ describe('renderConversationGraphToHtml', () => {
         expect(html).toContain('class="bonsai-gemini-structured"');
         expect(html).toContain('Thoughts');
     });
+
+    it('renders captured video artifacts with an embedded player', () => {
+        const graph: ConversationGraph = {
+            conversation_id: 'conv_video',
+            title: 'Gemini Video Capture',
+            source: {
+                provider_site: 'gemini.google.com',
+                url: 'https://gemini.google.com/app/example-video',
+                captured_at: '2026-04-07T12:00:00.000Z',
+                capture_version: '0.1.0',
+            },
+            provenance: {
+                provider: 'google',
+                model: 'gemini-2.5-pro',
+                confidence: 'observed',
+            },
+            messages: [
+                {
+                    message_id: 'msg_video_1',
+                    role: 'assistant',
+                    sequence: 0,
+                    origin: {
+                        provider: 'google',
+                        model: 'gemini-2.5-pro',
+                        confidence: 'observed',
+                    },
+                    content_blocks: [
+                        {
+                            type: 'markdown',
+                            value: 'Here is the generated clip.',
+                        },
+                    ],
+                    artifact_ids: ['artifact_video_1'],
+                    deep_link: {
+                        url: 'https://gemini.google.com/app/example-video',
+                    },
+                },
+            ],
+            artifacts: [
+                {
+                    artifact_id: 'artifact_video_1',
+                    type: 'video',
+                    title: 'Generated clip',
+                    mime_type: 'video/mp4',
+                    content: 'https://video.googleusercontent.com/generated/clip.mp4',
+                    source_message_id: 'msg_video_1',
+                    source_url: 'https://video.googleusercontent.com/generated/clip.mp4',
+                    view_url: 'https://gemini.google.com/app/example-video#clip',
+                    exportable: true,
+                },
+            ],
+        };
+
+        const html = renderConversationGraphToHtml(graph);
+
+        expect(html).toContain('<video controls preload="metadata" playsinline src="https://video.googleusercontent.com/generated/clip.mp4"');
+        expect(html).toContain('Generated clip');
+        expect(html).toContain('Open</a>');
+    });
 });

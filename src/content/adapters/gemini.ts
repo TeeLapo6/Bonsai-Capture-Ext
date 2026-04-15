@@ -45,10 +45,16 @@ export class GeminiAdapter extends BaseAdapter {
         const container = queryWithFallbacks(document, this.selectors.conversationContainer);
         if (!container) return null;
 
+        // Strip common Gemini page title suffixes/prefixes to isolate the conversation name
+        let title = document.title
+            .replace(/\s*[-–—|]\s*(Google\s+)?Gemini(\s+App)?$/i, '')
+            .replace(/^(Google\s+)?Gemini(\s*[-–—|]\s*)?/i, '')
+            .trim() || undefined;
+
         return {
             url: window.location.href,
             container,
-            title: document.title.replace(' - Gemini', '').trim() || undefined
+            title,
         };
     }
 
@@ -1504,28 +1510,34 @@ export class GeminiAdapter extends BaseAdapter {
     async scanSidebar(): Promise<SidebarItem[]> {
         const items: SidebarItem[] = [];
 
-        // Scroll the sidebar panel to lazy-load older conversations
+        // Scroll the sidebar panel to lazy-load older conversations.
+        // Gemini lazy-loads in batches; accounts with 100+ conversations
+        // need many scroll iterations to reach the bottom.
         const sidebarScrollable = document.querySelector(
             'nav, mat-sidenav, [class*="sidebar"], [data-testid*="sidebar"], aside'
         ) as HTMLElement | null;
         if (sidebarScrollable) {
+            // Try to find the actual scrollable child (Gemini often nests the scrollable area)
+            const innerScrollable = sidebarScrollable.querySelector('[style*="overflow"], [class*="scroll"]') as HTMLElement | null;
+            const scrollTarget = innerScrollable ?? sidebarScrollable;
+
             let prevCount = 0;
             let stableRounds = 0;
-            for (let i = 0; i < 15; i++) {
-                sidebarScrollable.scrollTop = sidebarScrollable.scrollHeight;
-                await new Promise(r => setTimeout(r, 650));
-                const count = document.querySelectorAll('a[href*="/chat/"], a[href*="/c/"]').length;
+            for (let i = 0; i < 60; i++) {
+                scrollTarget.scrollTop = scrollTarget.scrollHeight;
+                await new Promise(r => setTimeout(r, 700));
+                const count = document.querySelectorAll('a[href*="/chat/"], a[href*="/c/"], a[href*="/gem/"]').length;
                 if (count === prevCount) {
-                    if (++stableRounds >= 2) break;
+                    if (++stableRounds >= 3) break;
                 } else {
                     stableRounds = 0;
                 }
                 prevCount = count;
             }
-            sidebarScrollable.scrollTop = 0;
+            scrollTarget.scrollTop = 0;
         }
 
-        const anchors = Array.from(document.querySelectorAll('a[href*="/chat/"], a[href*="/c/"], a[data-testid*="conversation"], a[class*="conversation"]')) as HTMLAnchorElement[];
+        const anchors = Array.from(document.querySelectorAll('a[href*="/chat/"], a[href*="/c/"], a[href*="/gem/"], a[data-testid*="conversation"], a[class*="conversation"]')) as HTMLAnchorElement[];
 
         for (const link of anchors) {
             const rawHref = link.getAttribute('href') || '';

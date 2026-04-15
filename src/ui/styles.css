@@ -766,6 +766,21 @@ a:hover {
   margin-top: 0.22em;
 }
 
+.capture-settings-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.capture-settings-row .capture-metadata-panel {
+  border-bottom: none;
+}
+
+.capture-settings-row .capture-metadata-panel:first-child {
+  border-right: 1px solid var(--border-color);
+}
+
 .capture-metadata-panel {
   padding: 14px 16px;
 }
@@ -798,9 +813,38 @@ a:hover {
 }
 
 .capture-metadata-hint {
-  margin-top: 10px;
+  padding: 4px 16px 10px;
   font-size: 11px;
   color: var(--text-secondary);
+}
+
+.artifact-mode-toggle {
+  display: flex;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid var(--border-color);
+  margin-top: 4px;
+}
+
+.artifact-mode-btn {
+  flex: 1;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.artifact-mode-btn:first-child {
+  border-right: 1px solid var(--border-color);
+}
+
+.artifact-mode-btn.active {
+  background: var(--accent-primary);
+  color: #fff;
 }
 
 .capture-provider-setting {

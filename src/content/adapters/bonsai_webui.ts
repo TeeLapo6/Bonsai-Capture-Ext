@@ -41,24 +41,34 @@ window.addEventListener('BONSAI_CONFIG_UPDATE', (event: Event) => {
     }
 });
 
-// Signal that the extension is installed and ready
-// We do this via both a custom event (for the current session)
-// and a meta tag (for robust detection even if the page loaded first)
-function signalReady() {
-    window.dispatchEvent(new CustomEvent('BONSAI_EXTENSION_READY'));
-
-    // Inject meta tag for static detection
-    if (!document.querySelector('meta[name="bonsai-extension"]')) {
+// Inject meta tag for static detection — safe for document_start
+function injectMetaTag() {
+    if (document.querySelector('meta[name="bonsai-extension"]')) return;
+    const target = document.head || document.documentElement;
+    if (target) {
         const meta = document.createElement('meta');
         meta.name = 'bonsai-extension';
         meta.content = 'installed';
-        document.head.appendChild(meta);
+        target.appendChild(meta);
     }
 }
 
-signalReady();
+// Signal that the extension is installed and ready
+function signalReady() {
+    window.dispatchEvent(new CustomEvent('BONSAI_EXTENSION_READY'));
+    injectMetaTag();
+}
 
-// Also listen for a "Probe" to respond if the page already loaded before the extension
+// Register probe listener BEFORE signalReady so it always works even if
+// signalReady encounters an issue on the first call
 window.addEventListener('BONSAI_EXTENSION_PROBE', () => {
     signalReady();
 });
+
+// Signal immediately
+signalReady();
+
+// If document.head wasn't available yet (document_start), retry after DOM loads
+if (!document.head) {
+    document.addEventListener('DOMContentLoaded', injectMetaTag, { once: true });
+}

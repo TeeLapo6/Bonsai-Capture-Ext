@@ -2611,6 +2611,7 @@ export class ClaudeAdapter extends BaseAdapter {
         const panelOpenBeforeCapture = this.getClaudeArtifactPanelRoot();
 
         for (const ref of artifactRefs) {
+          try {
             const typeAttr = ref.getAttribute('data-artifact-type')?.toLowerCase()
                 ?? ref.querySelector('[data-artifact-type]')?.getAttribute('data-artifact-type')?.toLowerCase();
             const typeHint: 'code' | 'doc' | 'unknown' = typeAttr?.includes('code')
@@ -2767,6 +2768,19 @@ export class ClaudeAdapter extends BaseAdapter {
             }
 
             if (this.isNoiseOnlyArtifactText(content) && !viewUrl && !sourceUrl) {
+                // Even when content is noise, preserve the artifact as a metadata stub
+                // so that the artifact list, anchors, and Bonsai export include it.
+                if (title && title !== 'Artifact') {
+                    artifacts.push({
+                        artifact_id: artifactId,
+                        type,
+                        title,
+                        content: title,
+                        source_message_id: '',
+                        exportable: true,
+                        mime_type: type === 'code_artifact' ? 'text/plain' : 'text/markdown',
+                    });
+                }
                 continue;
             }
 
@@ -2785,6 +2799,9 @@ export class ClaudeAdapter extends BaseAdapter {
                     ? 'text/html'
                     : (type === 'code_artifact' ? 'text/plain' : inferredMimeType)
             });
+          } catch (refError) {
+            console.warn('[Bonsai] Claude parseArtifacts: failed to process artifact ref', refError);
+          }
         }
 
         // Close whichever panel is now open if none was open before capture began.
@@ -2950,6 +2967,167 @@ export class ClaudeAdapter extends BaseAdapter {
             items.push({ id, title, url: href });
         }
 
+        return items;
+    }
+
+    /**
+     * Discover Claude projects.
+     *
+     * Unlike ChatGPT (where project links appear in the sidebar), Claude hides
+     * projects behind a top-level /projects page.  If the user is already on that
+     * page we scrape it immediately; otherwise we navigate there, wait for the
+     * list to render, collect the links, then navigate back.
+     */
+    async discoverProjects(): Promise<import('./interface').ProjectInfo[]> {
+        const projects: import('./interface').ProjectInfo[] = [];
+        const seen = new Set<string>();
+
+        const collectProjectLinks = () => {
+            // Claude project links: /project/{uuid}
+            const links = document.querySelectorAll<HTMLAnchorElement>('a[href*="/project/"]');
+            links.forEach(link => {
+                const rawHref = link.getAttribute('href') || '';
+                if (!rawHref.includes('/project/')) return;
+                // Skip chat links inside projects like /project/{id}/chat/{id}
+                if (/\/chat\//.test(rawHref)) return;
+
+                const fullUrl = rawHref.startsWith('http') ? rawHref : `${window.location.origin}${rawHref}`;
+                if (seen.has(fullUrl)) return;
+                seen.add(fullUrl);
+
+                let name = link.innerText?.trim() || link.textContent?.trim() || '';
+                name = name.split('\n')[0].trim();
+                if (!name) {
+                    const uuidMatch = rawHref.match(/\/project\/([a-f0-9-]+)/i);
+                    name = uuidMatch ? `Project ${uuidMatch[1].slice(0, 8)}` : 'Unnamed Project';
+                }
+
+                projects.push({ url: fullUrl, name });
+            });
+        };
+
+        // First, try collecting from the current page (user may already be on /projects)
+        collectProjectLinks();
+
+        // If we found nothing and we're not on /projects, navigate there and scrape
+        if (projects.length === 0 && !window.location.pathname.startsWith('/projects')) {
+            const returnUrl = window.location.href;
+            window.location.href = `${window.location.origin}/projects`;
+
+            // Wait for the projects page to render
+            await new Promise<void>((resolve) => {
+                const deadline = Date.now() + 30000;
+                const poll = setInterval(() => {
+                    if (Date.now() > deadline) { clearInterval(poll); resolve(); return; }
+                    if (window.location.pathname.startsWith('/projects')) {
+                        const links = document.querySelectorAll('a[href*="/project/"]');
+                        if (links.length > 0 || Date.now() > deadline - 20000) {
+                            clearInterval(poll);
+                            resolve();
+                        }
+                    }
+                }, 500);
+            });
+
+            collectProjectLinks();
+
+            // Navigate back to the original page
+            window.location.href = returnUrl;
+            await new Promise(r => setTimeout(r, 2000));
+        }
+
+        console.log(`[Bonsai Capture] Discovered ${projects.length} Claude projects.`);
+        return projects;
+    }
+
+    /**
+     * Navigate to a Claude project page, scroll to lazy-load all conversations,
+     * and return the list of conversations within that project.
+     */
+    async scanProjectConversations(projectUrl: string, projectName: string): Promise<import('./interface').SidebarItem[]> {
+        console.log(`[Bonsai Capture] Scanning Claude project: ${projectName} (${projectUrl})`);
+
+        // Navigate to the project page
+        if (!window.location.href.includes(projectUrl.replace(/^https?:\/\/[^/]+/, ''))) {
+            window.location.href = projectUrl;
+
+            // Wait for the project page to load
+            await new Promise<void>((resolve) => {
+                const deadline = Date.now() + 45000;
+                const poll = setInterval(() => {
+                    if (Date.now() > deadline) { clearInterval(poll); resolve(); return; }
+                    const projectPath = new URL(projectUrl).pathname;
+                    if (window.location.pathname.startsWith(projectPath)) {
+                        // Wait for conversation links to appear
+                        const chatLinks = document.querySelectorAll('a[href*="/chat/"]');
+                        if (chatLinks.length > 0 || Date.now() > deadline - 30000) {
+                            clearInterval(poll);
+                            resolve();
+                        }
+                    }
+                }, 500);
+            });
+        }
+
+        // Scroll to lazy-load all conversations on the project page
+        const scrollable = document.querySelector(
+            'main, [role="main"], [class*="scroll"], [class*="content"]'
+        ) as HTMLElement | null;
+        if (scrollable) {
+            let prevCount = 0;
+            let stableRounds = 0;
+            for (let i = 0; i < 40; i++) {
+                scrollable.scrollTop = scrollable.scrollHeight;
+                await new Promise(r => setTimeout(r, 700));
+                const count = document.querySelectorAll('a[href*="/chat/"]').length;
+                if (count === prevCount) {
+                    if (++stableRounds >= 3) break;
+                } else {
+                    stableRounds = 0;
+                }
+                prevCount = count;
+            }
+        }
+
+        // Also click "Show more" / "Load more" buttons
+        for (let i = 0; i < 20; i++) {
+            const showMoreBtn = Array.from(document.querySelectorAll('button')).find(
+                b => /show more|load more|see more/i.test(b.textContent?.trim() ?? '')
+            ) as HTMLButtonElement | undefined;
+            if (!showMoreBtn) break;
+            showMoreBtn.click();
+            await new Promise(r => setTimeout(r, 700));
+        }
+
+        // Collect conversation links
+        const items: import('./interface').SidebarItem[] = [];
+        const seen = new Set<string>();
+        const anchors = document.querySelectorAll<HTMLAnchorElement>('a[href*="/chat/"]');
+
+        for (const link of anchors) {
+            const rawHref = link.getAttribute('href') || '';
+            const chatMatch = rawHref.match(/\/chat\/([a-f0-9-]+)/i);
+            if (!chatMatch) continue;
+
+            const chatId = chatMatch[1];
+            if (seen.has(chatId)) continue;
+            seen.add(chatId);
+
+            const href = rawHref.startsWith('http') ? rawHref : `${window.location.origin}${rawHref}`;
+
+            let title = link.innerText?.trim() || link.textContent?.trim() || 'Untitled';
+            title = title.split('\n')[0].trim();
+
+            items.push({
+                id: href,
+                title,
+                url: href,
+                projectName,
+                projectUrl,
+            });
+        }
+
+        console.log(`[Bonsai Capture] Found ${items.length} conversations in Claude project "${projectName}".`);
         return items;
     }
 

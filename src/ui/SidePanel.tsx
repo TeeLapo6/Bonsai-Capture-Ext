@@ -17,9 +17,11 @@ import Table from '@tiptap/extension-table';
 import TableRow from '@tiptap/extension-table-row';
 import TableHeader from '@tiptap/extension-table-header';
 import TableCell from '@tiptap/extension-table-cell';
-import type { ConversationGraph } from '../shared/schema';
-import { exportToMarkdown } from '../shared/exporters/markdown';
+import type { ContentBlock, ConversationGraph } from '../shared/schema';
+import { exportToMarkdown, type MarkdownExportOptions } from '../shared/exporters/markdown';
 import { exportToJSON } from '../shared/exporters/json';
+import { exportToHtml } from '../shared/exporters/html';
+import { toBonsaiImportPackage } from '../shared/bonsai-adapter';
 
 import { exportToTOONString } from '../shared/exporters/toon';
 import { markdownToHtml } from '../shared/markdown-to-html';
@@ -33,7 +35,7 @@ import bonsaiLogo from '../../../Bonsai-WebUI/src/components/icons/bonsai.png';
 
 import JSZip from 'jszip';
 
-type TabType = 'capture' | 'history' | 'export' | 'bulk';
+type TabType = 'capture' | 'history' | 'export' | 'bulk' | 'settings';
 type ThemePreference = 'light' | 'dark' | 'system';
 
 const THEME_STORAGE_KEY = 'bonsai-capture-theme';
@@ -97,12 +99,16 @@ interface CaptureMetadataOptions {
     includeTimestamps: boolean;
     includeModels: boolean;
     includeAnchors: boolean;
+    includeArtifacts: boolean;
+    artifactMode: 'inline' | 'appendix';
 }
 
 const DEFAULT_CAPTURE_METADATA_OPTIONS: CaptureMetadataOptions = {
     includeTimestamps: true,
     includeModels: true,
-    includeAnchors: true
+    includeAnchors: true,
+    includeArtifacts: true,
+    artifactMode: 'appendix',
 };
 
 interface CapturedItem {
@@ -121,6 +127,16 @@ interface BulkItem {
     url: string;
     status: 'pending' | 'capturing' | 'success' | 'error';
     selected: boolean;
+    failureReason?: string;
+    /** Populated when the conversation belongs to a project. */
+    projectName?: string;
+    /** Project page URL used to reopen project-scoped lists before clicking the conversation. */
+    projectUrl?: string;
+}
+
+interface ProjectInfo {
+    url: string;
+    name: string;
 }
 
 interface Diagnostics {
@@ -205,30 +221,243 @@ function findTextMatches(
     return matches;
 }
 
+function normalizeConversationPath(url: string): string {
+    try {
+        return new URL(url, window.location.href).pathname.replace(/\/$/, '');
+    } catch {
+        return url.split(/[?#]/)[0].replace(/\/$/, '');
+    }
+}
+
+/**
+ * Extract the conversation UUID from a URL that may be either:
+ *   /c/{id}                        — plain conversation
+ *   /g/{gpt-slug}/c/{id}           — custom-GPT-scoped conversation
+ *   /gem/{hex}/{hex}               — Gemini Gem conversation
+ */
+function extractConversationIdFromUrl(url: string): string | null {
+    const path = normalizeConversationPath(url);
+    // ChatGPT-style: /c/{uuid} or /g/{slug}/c/{uuid}
+    const chatgptMatch = path.match(/\/c\/([a-f0-9-]{8,})/i);
+    if (chatgptMatch) return chatgptMatch[1].toLowerCase();
+    // Gemini Gem: /gem/{hex}/{hex}
+    const gemMatch = path.match(/\/gem\/([a-f0-9]+\/[a-f0-9]+)/i);
+    if (gemMatch) return gemMatch[1].toLowerCase();
+    return null;
+}
+
+function matchesBulkCaptureTarget(graph: ConversationGraph, item: BulkItem): boolean {
+    const graphId = extractConversationIdFromUrl(graph.source.url);
+    const itemId  = extractConversationIdFromUrl(item.url) ?? item.id.toLowerCase();
+    if (graphId && itemId) return graphId === itemId;
+    // Fallback: full path comparison
+    return normalizeConversationPath(graph.source.url) === normalizeConversationPath(item.url);
+}
+
+function isGenericBulkCaptureTitle(title: string | undefined): boolean {
+    if (!title) return true;
+    return /^(chatgpt|untitled|project overview|new chat|google gemini|gemini|claude|claude chat|grok|copilot)$/i.test(title.trim());
+}
+
+function normalizeBulkCapturedGraph(graph: ConversationGraph, item: BulkItem): ConversationGraph {
+    return {
+        ...graph,
+        title: isGenericBulkCaptureTitle(graph.title) ? item.title : graph.title,
+    };
+}
+
+function hasNonEmptyContent(graph: ConversationGraph): boolean {
+    return graph.messages.some(m =>
+        m.content_blocks.some(b => {
+            switch (b.type) {
+                case 'markdown':
+                case 'html':
+                case 'text':
+                case 'code':
+                    return b.value.trim().length > 0;
+                case 'image_ref':
+                    return true;
+                case 'table':
+                    return b.rows.length > 0;
+                case 'list':
+                    return b.items.some(i => i.trim().length > 0);
+                default:
+                    return false;
+            }
+        })
+    );
+}
+
+function isUsableBulkCapture(graph: ConversationGraph | undefined, item: BulkItem): graph is ConversationGraph {
+    return Boolean(
+        graph
+        && matchesBulkCaptureTarget(graph, item)
+        && graph.messages.length > 0
+        && hasNonEmptyContent(graph)
+    );
+}
+
+/**
+ * Produce a human-readable diagnostic explaining why isUsableBulkCapture rejected
+ * the graph. Returns null when the graph IS usable (shouldn't happen in practice
+ * since this is only called on the failure path).
+ */
+function diagnoseBulkCaptureRejection(graph: ConversationGraph | undefined, item: BulkItem): string {
+    if (!graph) return 'No graph returned by capture.';
+
+    const urlMatch = matchesBulkCaptureTarget(graph, item);
+    if (!urlMatch) {
+        const graphId = extractConversationIdFromUrl(graph.source.url) ?? normalizeConversationPath(graph.source.url);
+        const itemId  = extractConversationIdFromUrl(item.url) ?? item.id;
+        return (
+            `URL mismatch — captured ID "${graphId}" ≠ expected "${itemId}". ` +
+            `Full captured path: "${normalizeConversationPath(graph.source.url)}".`
+        );
+    }
+
+    if (graph.messages.length === 0) return 'Graph has 0 messages.';
+
+    // Detailed content inspection
+    const perMessage = graph.messages.map((m, i) => {
+        const blockCount = m.content_blocks.length;
+        const nonEmpty = m.content_blocks.filter(b => {
+            switch (b.type) {
+                case 'markdown': case 'html': case 'text': case 'code':
+                    return b.value.trim().length > 0;
+                case 'image_ref': return true;
+                case 'table': return b.rows.length > 0;
+                case 'list': return b.items.some(ii => ii.trim().length > 0);
+                default: return false;
+            }
+        }).length;
+        const types = m.content_blocks.map(b => b.type).join(',') || 'none';
+        return `msg[${i}] role=${m.role} blocks=${blockCount} nonEmpty=${nonEmpty} types=[${types}]`;
+    });
+
+    return `All ${graph.messages.length} message(s) have empty content.\n` + perMessage.join('\n');
+}
+
+function stringifyBulkCaptureError(error: unknown): string {
+    if (error instanceof Error) {
+        return error.message || error.name || 'Unknown error';
+    }
+
+    if (typeof error === 'string') {
+        return error;
+    }
+
+    if (error === null || error === undefined) {
+        return 'Unknown error';
+    }
+
+    try {
+        return JSON.stringify(error);
+    } catch {
+        return String(error);
+    }
+}
+
+function formatBulkFailureReason(stage: string, error?: unknown): string {
+    const detail = error === undefined ? '' : stringifyBulkCaptureError(error).replace(/\s+/g, ' ').trim();
+    const message = detail && detail !== 'Unknown error' ? `${stage}: ${detail}` : stage;
+    return message.slice(0, 240);
+}
+
+/**
+ * After loadConversation returns, verify the tab has arrived at the target URL
+ * with a live content script AND that the conversation content is fully rendered.
+ *
+ * Using LOAD_CONVERSATION (rather than a bare GET_DIAGNOSTICS ping) achieves both:
+ * - If the content script isn't alive yet, sendMessage throws → we keep polling.
+ * - If the content script is alive but the conversation hasn't rendered yet,
+ *   loadConversation() waits for a stable DOM fingerprint before returning.
+ *
+ * Required for the window.location.href fallback path where the page fully reloads
+ * and a new content script must boot, navigate, and render before capture is safe.
+ * For SPA navigations the call completes in < 50 ms (already at URL, content loaded).
+ */
+async function waitForTabReadyAtUrl(
+    tabId: number,
+    urlFragment: string,
+    projectUrl?: string,
+    timeoutMs = 90000
+): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+        try {
+            const tab = await chrome.tabs.get(tabId);
+            if (tab.url?.includes(urlFragment)) {
+                // Send LOAD_CONVERSATION — it waits internally for stable DOM content.
+                // Throws if content script is not alive → caught below, keep polling.
+                const loadResp = await chrome.tabs.sendMessage(tabId, {
+                    type: 'LOAD_CONVERSATION',
+                    id: urlFragment,
+                    projectUrl,
+                }).catch(() => null);
+                if (loadResp?.success) return true;
+            }
+        } catch { /* tab navigating or content script not ready; continue */ }
+
+        await new Promise(r => setTimeout(r, 600));
+    }
+
+    return false;
+}
+
 // Sub-component for Batch History Items to avoid Hook-in-Loop errors
 const HistoryBatchItem = ({
     groupKey,
     group,
     onSelectMarkdown,
     onSelectSingle,
-    onExportBatchOnly
+    onExportBatchOnly,
+    markdownOptions
 }: {
     groupKey: string;
     group: CapturedItem[];
     onSelectMarkdown: (markdown: string, mergedItem: CapturedItem, batchItems: CapturedItem[]) => void;
     onSelectSingle: (item: CapturedItem) => void;
     onExportBatchOnly: (group: CapturedItem[]) => void;
+    markdownOptions?: MarkdownExportOptions;
 }) => {
     const [expanded, setExpanded] = useState(false);
+    const [batchLoading, setBatchLoading] = useState(false);
+    const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0 });
+    const cancelRef = useRef(false);
 
-    const handleBatchLoad = () => {
-        // Generate Concatenated Markdown
-        const fullMarkdown = group.map(item => {
-            const md = exportToMarkdown(item.data);
-            return `# Conversation: ${item.data.title || 'Untitled'}\n\n${md}`;
-        }).join('\n\n---\n\n');
+    const handleBatchLoad = async () => {
+        cancelRef.current = false;
+        setBatchLoading(true);
+        setBatchProgress({ current: 0, total: group.length });
 
-        // Create a merged item structure just for context (retaining the first one's metadata)
+        const CHUNK_SIZE = 5;
+        const markdowns: string[] = [];
+
+        for (let i = 0; i < group.length; i += CHUNK_SIZE) {
+            if (cancelRef.current) {
+                setBatchLoading(false);
+                return;
+            }
+
+            const chunk = group.slice(i, i + CHUNK_SIZE);
+            for (const item of chunk) {
+                const md = exportToMarkdown(item.data, markdownOptions);
+                markdowns.push(`# Conversation: ${item.data.title || 'Untitled'}\n\n${md}`);
+            }
+            setBatchProgress({ current: Math.min(i + CHUNK_SIZE, group.length), total: group.length });
+
+            // Yield to the browser between chunks
+            await new Promise(r => setTimeout(r, 0));
+        }
+
+        if (cancelRef.current) {
+            setBatchLoading(false);
+            return;
+        }
+
+        const fullMarkdown = markdowns.join('\n\n---\n\n');
+
         const mergedMessages = group.flatMap(g => g.data.messages);
         const mergedGraph: ConversationGraph = {
             ...group[0].data,
@@ -244,11 +473,41 @@ const HistoryBatchItem = ({
             batchId: groupKey
         };
 
+        setBatchLoading(false);
         onSelectMarkdown(fullMarkdown, mergedItem, group);
     };
 
+    const handleCancel = () => {
+        cancelRef.current = true;
+    };
+
     return (
-        <div key={groupKey} className="history-group" style={{ marginBottom: '8px', border: '1px solid var(--border-color)', borderRadius: '4px', background: 'var(--bg-secondary)' }}>
+        <div key={groupKey} className="history-group" style={{ marginBottom: '8px', border: '1px solid var(--border-color)', borderRadius: '4px', background: 'var(--bg-secondary)', position: 'relative' }}>
+            {/* Batch loading overlay */}
+            {batchLoading && (
+                <div style={{
+                    position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 20,
+                    display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+                    borderRadius: '4px', gap: '8px',
+                }}>
+                    <div style={{ color: '#fff', fontSize: '13px', fontWeight: 600 }}>
+                        Loading {batchProgress.current} / {batchProgress.total}
+                    </div>
+                    <div style={{ width: '70%', height: '6px', borderRadius: '3px', background: 'rgba(255,255,255,0.25)', overflow: 'hidden' }}>
+                        <div style={{
+                            width: `${batchProgress.total ? (batchProgress.current / batchProgress.total) * 100 : 0}%`,
+                            height: '100%', background: '#4ade80', borderRadius: '3px', transition: 'width 0.15s ease',
+                        }} />
+                    </div>
+                    <button
+                        className="btn btn-sm"
+                        style={{ padding: '3px 14px', fontSize: '11px', background: 'rgba(255,255,255,0.15)', color: '#fff', border: '1px solid rgba(255,255,255,0.3)', cursor: 'pointer', borderRadius: '4px', marginTop: '4px' }}
+                        onClick={handleCancel}
+                    >
+                        Cancel
+                    </button>
+                </div>
+            )}
             <div
                 className="history-group-header"
                 style={{ padding: '8px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', userSelect: 'none' }}
@@ -268,12 +527,13 @@ const HistoryBatchItem = ({
                     <button
                         className="btn btn-sm btn-secondary"
                         style={{ padding: '2px 8px', fontSize: '11px', height: '24px', lineHeight: '1' }}
+                        disabled={batchLoading}
                         onClick={(e) => {
                             e.stopPropagation();
                             handleBatchLoad();
                         }}
                     >
-                        Load
+                        {batchLoading ? '⏳' : 'Load'}
                     </button>
                 </div>
             </div>
@@ -324,9 +584,13 @@ export function SidePanel() {
     const [bulkItems, setBulkItems] = useState<BulkItem[]>([]);
     const [isBulkScanning, setIsBulkScanning] = useState(false);
     const [isBulkCapturing, setIsBulkCapturing] = useState(false);
-    const [bulkLimit, setBulkLimit] = useState(10);
-    const [bulkDelay, setBulkDelay] = useState(3000);
+    const [bulkDelay] = useState(3000);
     const isBulkCapturingRef = useRef(false);
+    const [availableProjects, setAvailableProjects] = useState<ProjectInfo[]>([]);
+    // scopeIncludeSidebar / scopeProjectUrls control what gets scanned; auto-discovered when bulk tab opens
+    const [scopeIncludeSidebar, setScopeIncludeSidebar] = useState(true);
+    const [scopeProjectUrls, setScopeProjectUrls] = useState<Set<string>>(new Set());
+    const [isDiscoveringProjects, setIsDiscoveringProjects] = useState(false);
     const [lightboxImage, setLightboxImage] = useState<string | null>(null);
     const [exportBatch, setExportBatch] = useState<CapturedItem[] | null>(null);
     const [searchTerm, setSearchTerm] = useState('');
@@ -347,6 +611,13 @@ export function SidePanel() {
     const [findStats, setFindStats] = useState<{ current: number; total: number } | null>(null);
     const findMatchesRef = useRef<Array<{ node: Text; start: number; end: number }>>([]);
     const findCurrentIndexRef = useRef(-1);
+
+    // Bonsai connection state
+    const [bonsaiHost, setBonsaiHost] = useState('');
+    const [bonsaiApiKey, setBonsaiApiKey] = useState('');
+    const [isImporting, setIsImporting] = useState(false);
+    const [importProgress, setImportProgress] = useState<{ current: number; total: number } | null>(null);
+    const [importLog, setImportLog] = useState<Array<{ title: string; success: boolean; error?: string }> | null>(null);
 
     const editor = useEditor({
         extensions: [
@@ -444,11 +715,25 @@ export function SidePanel() {
         const includeTimestamps = captureMetadataOptions.includeTimestamps;
         const includeModels = captureMetadataOptions.includeModels;
         const includeAnchors = captureMetadataOptions.includeAnchors;
+        const includeArtifacts = captureMetadataOptions.includeArtifacts;
+        const shouldKeepArtifactBlocks = (block: ContentBlock): boolean => {
+            if (block.type === 'image_ref') {
+                return false;
+            }
+
+            if (block.type === 'markdown') {
+                return !/^\s*See appendix:/i.test(block.value.trim());
+            }
+
+            return true;
+        };
 
         return {
             ...graph,
             messages: graph.messages.map((message) => ({
                 ...message,
+                artifact_ids: includeArtifacts ? message.artifact_ids : [],
+                content_blocks: includeArtifacts ? message.content_blocks : message.content_blocks.filter(shouldKeepArtifactBlocks),
                 created_at: includeTimestamps ? message.created_at : undefined,
                 origin: includeModels
                     ? message.origin
@@ -465,7 +750,9 @@ export function SidePanel() {
                         selector_hint: undefined
                     }
             })),
-            artifacts: graph.artifacts.map((artifact) => ({ ...artifact }))
+            artifacts: includeArtifacts
+                ? graph.artifacts.map((artifact) => ({ ...artifact }))
+                : []
         };
     }, [captureMetadataOptions]);
 
@@ -473,10 +760,10 @@ export function SidePanel() {
         setCurrentCapture(graph);
 
         if (editor) {
-            const html = renderConversationGraphToHtml(graph);
+            const html = renderConversationGraphToHtml(graph, { artifactMode: captureMetadataOptions.artifactMode });
             editor.commands.setContent(html);
         }
-    }, [editor]);
+    }, [editor, captureMetadataOptions.artifactMode]);
 
     const handleCaptureFind = useCallback((direction: 'forward' | 'backward' = 'forward') => {
         const query = captureSearchQuery.trim();
@@ -698,6 +985,14 @@ export function SidePanel() {
         };
     }, []);
 
+    // Auto-discover projects when the user opens the Bulk tab
+    useEffect(() => {
+        if (activeTab === 'bulk' && availableProjects.length === 0 && !isDiscoveringProjects) {
+            discoverProjectsForScope();
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [activeTab]);
+
     // Listen for inline button clicks (MESSAGE_SELECTED from background)
     useEffect(() => {
         const handleMessage = async (message: any) => {
@@ -772,8 +1067,108 @@ export function SidePanel() {
         }
     }, [providerCaptureSettings, addToHistory, applyCaptureMetadataOptions, loadCaptureIntoEditor]);
 
+    // =========================================================================
+    // Bonsai Connection — load config, save config, send single/bulk
+    // =========================================================================
+    useEffect(() => {
+        chrome.storage.local.get(['bonsaiHost', 'bonsaiApiKey'], (result) => {
+            if (result.bonsaiHost) setBonsaiHost(result.bonsaiHost);
+            if (result.bonsaiApiKey) setBonsaiApiKey(result.bonsaiApiKey);
+        });
+
+        // Listen for config changes from the WebUI bridge (background.ts → storage)
+        const handleStorageChange = (changes: { [key: string]: chrome.storage.StorageChange }, area: string) => {
+            if (area !== 'local') return;
+            if (changes.bonsaiHost?.newValue) setBonsaiHost(changes.bonsaiHost.newValue);
+            if (changes.bonsaiApiKey?.newValue) setBonsaiApiKey(changes.bonsaiApiKey.newValue);
+        };
+        chrome.storage.onChanged.addListener(handleStorageChange);
+        return () => chrome.storage.onChanged.removeListener(handleStorageChange);
+    }, []);
+
+    const handleSaveSettings = useCallback(() => {
+        chrome.storage.local.set({ bonsaiHost, bonsaiApiKey }, () => {
+            console.log('Bonsai settings saved');
+        });
+    }, [bonsaiHost, bonsaiApiKey]);
+
+    const handleImportToBonsai = useCallback(async () => {
+        if (!currentCapture) return;
+        setIsImporting(true);
+        try {
+            const importPkg = toBonsaiImportPackage(currentCapture);
+            const response = await new Promise<any>((resolve) => {
+                chrome.runtime.sendMessage(
+                    { type: 'SEND_TO_BONSAI', payload: importPkg },
+                    resolve
+                );
+            });
+
+            if (response?.success) {
+                const conversationId = response.data?.conversation_id;
+                if (conversationId && bonsaiHost) {
+                    window.open(`${bonsaiHost}/c/${conversationId}`, '_blank');
+                }
+            } else {
+                console.error('Import failed:', response?.error);
+                alert(`Import failed: ${response?.error || 'Unknown error'}`);
+            }
+        } catch (e) {
+            console.error('Import error:', e);
+            alert(`Import error: ${e}`);
+        } finally {
+            setIsImporting(false);
+        }
+    }, [currentCapture, bonsaiHost]);
+
+    const handleBulkImportToBonsai = useCallback(async (items: CapturedItem[]) => {
+        setIsImporting(true);
+        setImportProgress({ current: 0, total: items.length });
+        setImportLog(null);
+        let successCount = 0;
+        const log: Array<{ title: string; success: boolean; error?: string }> = [];
+        try {
+            for (let i = 0; i < items.length; i++) {
+                const title = items[i].data.title || `Conversation ${i + 1}`;
+                const importPkg = toBonsaiImportPackage(items[i].data);
+                const response = await new Promise<any>((resolve) => {
+                    chrome.runtime.sendMessage(
+                        { type: 'SEND_TO_BONSAI', payload: importPkg },
+                        resolve
+                    );
+                });
+
+                if (response?.success) {
+                    successCount++;
+                    log.push({ title, success: true });
+                } else {
+                    const error = response?.error || 'Unknown error';
+                    console.warn(`Bulk import item ${i + 1} failed:`, error);
+                    log.push({ title, success: false, error });
+                }
+                setImportProgress({ current: i + 1, total: items.length });
+            }
+
+            setImportLog(log);
+            const failCount = items.length - successCount;
+            if (failCount === 0) {
+                alert(`All ${successCount} conversations imported to Bonsai!`);
+            } else {
+                alert(`Imported ${successCount} of ${items.length} conversations. ${failCount} failed — see log below.`);
+            }
+        } catch (e) {
+            console.error('Bulk import error:', e);
+            alert(`Bulk import error: ${e}`);
+        } finally {
+            setIsImporting(false);
+            setImportProgress(null);
+        }
+    }, []);
+
+    const isBonsaiConfigured = Boolean(bonsaiHost && bonsaiApiKey);
+
     // Export handlers
-    const handleExport = useCallback((format: string) => {
+    const handleExport = useCallback((format: 'markdown' | 'json' | 'html' | 'toon' | 'bonsai') => {
         if (!currentCapture) return;
 
         let content: string;
@@ -782,7 +1177,7 @@ export function SidePanel() {
 
         switch (format) {
             case 'markdown':
-                content = exportToMarkdown(currentCapture);
+                content = exportToMarkdown(currentCapture, { artifactMode: captureMetadataOptions.artifactMode });
                 filename = `${currentCapture.title ?? 'conversation'}.md`;
                 mimeType = 'text/markdown';
                 break;
@@ -791,9 +1186,19 @@ export function SidePanel() {
                 filename = `${currentCapture.title ?? 'conversation'}.json`;
                 mimeType = 'application/json';
                 break;
+            case 'html':
+                content = exportToHtml(currentCapture, { artifactMode: captureMetadataOptions.artifactMode });
+                filename = `${currentCapture.title ?? 'conversation'}.html`;
+                mimeType = 'text/html';
+                break;
             case 'toon':
                 content = exportToTOONString(currentCapture);
                 filename = `${currentCapture.title ?? 'conversation'}.toon.json`;
+                mimeType = 'application/json';
+                break;
+            case 'bonsai':
+                content = JSON.stringify(toBonsaiImportPackage(currentCapture), null, 2);
+                filename = `${currentCapture.title ?? 'conversation'}.bonsai.json`;
                 mimeType = 'application/json';
                 break;
             default:
@@ -811,24 +1216,79 @@ export function SidePanel() {
     }, [currentCapture]);
 
     // Insert to editor
-    const handleScanSidebar = async () => {
+    const discoverProjectsForScope = async () => {
+        setIsDiscoveringProjects(true);
+        try {
+            const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (!tab?.id) return;
+            const response = await chrome.tabs.sendMessage(tab.id, { type: 'DISCOVER_PROJECTS' }).catch(() => null);
+            if (response?.projects) {
+                const projects = response.projects as ProjectInfo[];
+                setAvailableProjects(projects);
+                // Auto-select all discovered projects that aren't already scoped
+                setScopeProjectUrls(prev => {
+                    const next = new Set(prev);
+                    projects.forEach(p => next.add(p.url));
+                    return next;
+                });
+            }
+        } catch (e) {
+            console.error('Project discovery failed', e);
+        } finally {
+            setIsDiscoveringProjects(false);
+        }
+    };
+
+    const handleScan = async () => {
         setIsBulkScanning(true);
         try {
             const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
             if (!tab?.id) return;
 
-            const response = await chrome.tabs.sendMessage(tab.id, { type: 'SCAN_SIDEBAR' });
-            if (response && response.items) {
-                const newItems = response.items;
+            const addItems = (newItems: any[], projectName?: string) => {
                 setBulkItems(prev => {
                     const existingIds = new Set(prev.map(i => i.id));
-                    const uniqueNew = newItems.filter((i: any) => !existingIds.has(i.id)).map((i: any) => ({
-                        ...i,
-                        status: 'pending',
-                        selected: true
-                    }));
-                    return [...prev, ...uniqueNew];
+                    const mapped = newItems
+                        .filter((i: any) => !existingIds.has(i.id))
+                        .map((i: any) => ({
+                            id: i.id,
+                            title: i.title,
+                            url: i.url,
+                            status: 'pending' as const,
+                            selected: true,
+                            ...(projectName ? { projectName } : i.projectName ? { projectName: i.projectName } : {}),
+                            ...(i.projectUrl ? { projectUrl: i.projectUrl } : {}),
+                        }));
+                    return [...prev, ...mapped];
                 });
+            };
+
+            // 1. Sidebar scan
+            if (scopeIncludeSidebar) {
+                const response = await chrome.tabs.sendMessage(tab.id, { type: 'SCAN_SIDEBAR' }).catch(() => null);
+                if (response?.items) addItems(response.items);
+            }
+
+            // 2. Project scans — done sequentially so the content script has time to navigate
+            for (const project of availableProjects) {
+                if (!scopeProjectUrls.has(project.url)) continue;
+
+                // SCAN_PROJECT causes the page to navigate; wait for the new content script
+                // The SCAN_PROJECT handler returns only after it has finished scrolling.
+                const response = await chrome.tabs.sendMessage(tab.id, {
+                    type: 'SCAN_PROJECT',
+                    projectUrl: project.url,
+                    projectName: project.name,
+                }).catch(() => null);
+
+                if (response?.items) {
+                    addItems(response.items, project.name);
+                }
+
+                // After navigation, re-query the tab to get updated tabId if needed
+                // (tab ID stays stable across SPA navigations; refresh the handle)
+                const [refreshedTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+                if (refreshedTab?.id) Object.assign(tab, refreshedTab);
             }
         } catch (e) {
             console.error('Scan failed', e);
@@ -837,82 +1297,185 @@ export function SidePanel() {
         }
     };
 
+    /** Send a message to a tab with a timeout — prevents the bulk loop from stalling
+     *  indefinitely when a content script hangs on a complex page. */
+    const sendMessageWithTimeout = <T = unknown>(
+        tabId: number,
+        message: unknown,
+        timeoutMs: number,
+    ): Promise<T> => {
+        return Promise.race([
+            chrome.tabs.sendMessage(tabId, message) as Promise<T>,
+            new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error(`sendMessage timed out after ${timeoutMs}ms`)), timeoutMs),
+            ),
+        ]);
+    };
+
     const handleBulkCapture = async () => {
         setIsBulkCapturing(true);
         isBulkCapturingRef.current = true;
 
+        // Reset all previously-captured items back to pending so they re-capture
+        setBulkItems(prev => prev.map(i =>
+            i.selected && (i.status === 'success' || i.status === 'error')
+                ? { ...i, status: 'pending' as const, failureReason: undefined }
+                : i
+        ));
+
         try {
-            const itemsToCapture = bulkItems.filter(i => i.selected && i.status !== 'success');
+            const setBulkItemStatus = (itemId: string, status: BulkItem['status'], failureReason?: string) => {
+                setBulkItems(prev => prev.map(i => i.id === itemId
+                    ? {
+                        ...i,
+                        status,
+                        failureReason: status === 'error' ? (failureReason ?? i.failureReason) : undefined,
+                    }
+                    : i
+                ));
+            };
+
+            const itemsToCapture = bulkItems.filter(i => i.selected);
             const batchId = crypto.randomUUID();
+            const batchCapturedItems: CapturedItem[] = [];
 
             for (const item of itemsToCapture) {
                 if (!isBulkCapturingRef.current) break;
 
-                setBulkItems(prev => prev.map(i => i.id === item.id ? { ...i, status: 'capturing' } : i));
+                let lastFailureReason = '';
+                const markFailure = (reason: string) => {
+                    lastFailureReason = reason;
+                    setBulkItemStatus(item.id, 'error', reason);
+                };
 
-                const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-                if (!tab?.id) continue;
+                try {
+                    setBulkItemStatus(item.id, 'capturing');
 
-                await chrome.tabs.sendMessage(tab.id, { type: 'LOAD_CONVERSATION', id: item.id });
+                    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+                    if (!tab?.id) {
+                        markFailure('No active tab was available for bulk capture.');
+                        continue;
+                    }
 
-                await new Promise(r => setTimeout(r, bulkDelay));
+                    const loadResponse = await sendMessageWithTimeout<any>(tab.id, {
+                        type: 'LOAD_CONVERSATION',
+                        id: item.id,
+                        projectUrl: item.projectUrl,
+                    }, 30000).catch(() => null);
 
-                if (!isBulkCapturingRef.current) break;
+                    // If SPA navigation failed AND this is a project conversation,
+                    // fall back to a hard URL navigation via scripting.executeScript so
+                    // the content script is not required to find a project back-link in
+                    // the sidebar (which is unreliable due to virtual DOM rendering).
+                    if (!loadResponse?.success) {
+                        if (item.projectUrl) {
+                            lastFailureReason = 'LOAD_CONVERSATION did not report success; falling back to a direct project reload.';
+                            try {
+                                await chrome.scripting.executeScript({
+                                    target: { tabId: tab.id },
+                                    world: 'MAIN',
+                                    func: (url: string) => { location.href = url; },
+                                    args: [item.url],
+                                });
+                                // Fall through to waitForTabReadyAtUrl below — it will
+                                // poll until the reloaded page's content script is ready.
+                            } catch (navError) {
+                                markFailure(formatBulkFailureReason('Direct project reload failed', navError));
+                                continue;
+                            }
+                        } else {
+                            markFailure('LOAD_CONVERSATION did not report success for a non-project conversation.');
+                            continue;
+                        }
+                    }
 
-                const response = await chrome.tabs.sendMessage(tab.id, {
-                    type: 'CAPTURE',
-                    scope: 'entire',
-                    providerCaptureSettings,
-                });
+                    // Verify the tab has arrived at the target URL with an active content
+                    // script and fully-rendered conversation content.
+                    // For hard-navigated project items we pass no projectUrl — we are
+                    // already at /c/{id} so no further navigation is needed inside
+                    // loadConversation; it just checks the DOM fingerprint.
+                    const waitProjectUrl = loadResponse?.success ? item.projectUrl : undefined;
+                    const tabReady = await waitForTabReadyAtUrl(tab.id, item.id, waitProjectUrl, 90000);
+                    if (!tabReady) {
+                        markFailure(
+                            loadResponse?.success
+                                ? 'Timed out waiting for the conversation to stabilize after navigation.'
+                                : 'Timed out waiting for the reloaded project conversation to stabilize.'
+                        );
+                        continue;
+                    }
 
-                if (response && response.data) {
-                    const graph = applyCaptureMetadataOptions(response.data as ConversationGraph);
-                    addToHistory(graph, item.url, ['bulk'], batchId);
-                    setBulkItems(prev => prev.map(i => i.id === item.id ? { ...i, status: 'success' } : i));
-                } else {
-                    setBulkItems(prev => prev.map(i => i.id === item.id ? { ...i, status: 'error' } : i));
+                    let capturedGraph: ConversationGraph | null = null;
+                    const maxAttempts = 3;
+
+                    for (let attempt = 0; attempt < maxAttempts && isBulkCapturingRef.current; attempt++) {
+                        try {
+                            const response = await sendMessageWithTimeout<any>(tab.id, {
+                                type: 'CAPTURE',
+                                scope: 'entire',
+                                providerCaptureSettings,
+                            }, 60000);
+
+                            const graph = response?.data as ConversationGraph | undefined;
+                            const captureData = response?.data as { messages?: unknown[] } | undefined;
+                            const messageCount = Array.isArray(captureData?.messages)
+                                ? captureData.messages.length
+                                : 0;
+                            if (isUsableBulkCapture(graph, item)) {
+                                capturedGraph = applyCaptureMetadataOptions(normalizeBulkCapturedGraph(graph, item));
+                                break;
+                            }
+
+                            const diagDetail = diagnoseBulkCaptureRejection(graph, item);
+                            lastFailureReason = messageCount > 0
+                                ? `attempt ${attempt + 1}/${maxAttempts}: ${diagDetail}`
+                                : `attempt ${attempt + 1}/${maxAttempts}: returned no graph data.`;
+                        } catch (captureErr) {
+                            lastFailureReason = formatBulkFailureReason(
+                                `CAPTURE attempt ${attempt + 1}/${maxAttempts} failed`,
+                                captureErr
+                            );
+                            console.warn('[Bonsai] Bulk CAPTURE attempt failed', item.id, attempt, captureErr);
+                        }
+
+                        if (attempt < maxAttempts - 1) {
+                            await new Promise(r => setTimeout(r, bulkDelay));
+                        }
+                    }
+
+                    if (capturedGraph) {
+                        addToHistory(capturedGraph, item.url, ['bulk'], batchId);
+                        batchCapturedItems.push({
+                            id: crypto.randomUUID(),
+                            timestamp: new Date().toISOString(),
+                            data: capturedGraph,
+                            source: item.url,
+                            tags: ['bulk'],
+                            batchId,
+                        });
+                        setBulkItemStatus(item.id, 'success');
+                    } else {
+                        markFailure(lastFailureReason || `CAPTURE failed after ${maxAttempts} attempts.`);
+                    }
+                } catch (itemError) {
+                    const reason = formatBulkFailureReason('Bulk capture item failed', itemError);
+                    console.error('Bulk capture item failed', item.id, itemError);
+                    setBulkItemStatus(item.id, 'error', reason);
                 }
             }
 
-            // Auto-load the captured batch into context if any succeeded
-            const successfulIds = bulkItems.filter(i => i.selected && i.status !== 'error').map(i => i.id); // Capturing becomes success
-            if (successfulIds.length > 0) {
-                // We need to fetch the CapturedItems. We rely on them being in state `captures`.
-                // But `captures` state might not be updated immediately in this closure?
-                // `addToHistory` calls `setCaptures`.
-                // We can construct the batch group here from the `batchId` we just used.
-
-                // However, we don't have access to the full `item` data here easily unless we retained it.
-                // Let's assume the user will go to History or Export. 
-                // But user specifically said: "I would expect that it should have loaded up the bulk capture"
-
-                // We can trigger a lookup?
-                // Or just set `exportBatch` manually if we can find them.
-                // Since `captures` is a prop/state, it might be stale here.
-                // But we can try to rely on the fact that we pushed them.
-
-                // Alternative: Just Notify?
-                // Best effort: set `exportBatch` using a functional update on `captures`? No, `setExportBatch` takes `CapturedItem[]`.
-
-                // Let's defer to the user's manual action for now, OR try to reload from storage.
-                chrome.storage.local.get(['captures'], (result) => {
-                    const storedCaptures = result.captures as CapturedItem[] || [];
-                    const batchItems = storedCaptures.filter(c => c.batchId === batchId);
-                    if (batchItems.length > 0) {
-                        setExportBatch(batchItems);
-                        // Also set currentCapture to merged?
-                        const mergedMessages = batchItems.flatMap(g => g.data.messages);
-                        const mergedGraph: ConversationGraph = {
-                            ...batchItems[0].data,
-                            title: `Batch Capture (${batchItems.length}) - ${new Date().toLocaleDateString()}`,
-                            messages: mergedMessages,
-                            artifacts: batchItems.flatMap(g => g.data.artifacts || [])
-                        };
-                        setCurrentCapture(mergedGraph);
-                        // Do NOT switch tab automatically? User said "Navigating to the export tab...".
-                        // So if they navigate, it should be there.
-                    }
-                });
+            // Auto-load the captured batch into the export panel from our in-memory list
+            // (avoids the race with chrome.storage.local async write).
+            if (batchCapturedItems.length > 0) {
+                setExportBatch(batchCapturedItems);
+                const mergedMessages = batchCapturedItems.flatMap(g => g.data.messages);
+                const mergedGraph: ConversationGraph = {
+                    ...batchCapturedItems[0].data,
+                    title: `Batch Capture (${batchCapturedItems.length}) - ${new Date().toLocaleDateString()}`,
+                    messages: mergedMessages,
+                    artifacts: batchCapturedItems.flatMap(g => g.data.artifacts || [])
+                };
+                setCurrentCapture(mergedGraph);
             }
 
         } catch (e) {
@@ -923,10 +1486,17 @@ export function SidePanel() {
         }
     };
 
-    const handleToggleCaptureMetadataOption = (key: keyof CaptureMetadataOptions) => {
+    const handleToggleCaptureMetadataOption = (key: 'includeTimestamps' | 'includeModels' | 'includeAnchors' | 'includeArtifacts') => {
         setCaptureMetadataOptions((prev) => ({
             ...prev,
             [key]: !prev[key]
+        }));
+    };
+
+    const handleSetArtifactMode = (mode: 'inline' | 'appendix') => {
+        setCaptureMetadataOptions((prev) => ({
+            ...prev,
+            artifactMode: mode
         }));
     };
 
@@ -939,7 +1509,7 @@ export function SidePanel() {
         setActiveTab('capture');
     }, [editor, loadCaptureIntoEditor]);
 
-    const handleBulkExport = async (format: 'markdown' | 'json', items?: CapturedItem[]) => {
+    const handleBulkExport = async (format: 'markdown' | 'json' | 'html' | 'bonsai', items?: CapturedItem[]) => {
         // If items are passed (from History Batch Export), use them.
         // Otherwise use selected bulk items (which might be empty if we moved away).
         // Actually, we are deprecating the Bulk Tab export buttons.
@@ -958,18 +1528,33 @@ export function SidePanel() {
 
         const zip = new JSZip();
 
+        const titleCounts = new Map<string, number>();
         for (const item of targetItems) {
-            // Use conversation ID to ensure uniqueness in the ZIP file
-            const shortId = item.data.conversation_id.substring(0, 8);
-            const safeTitle = (item.data.title || 'untitled').replace(/[^a-z0-9\-_]/gi, '_').substring(0, 50);
-            const filename = `${safeTitle}_${shortId}`;
+            const safeTitle = (item.data.title || 'untitled').replace(/[^a-z0-9\-_]/gi, '_').replace(/^_+|_+$/g, '').substring(0, 60) || 'untitled';
+            const count = titleCounts.get(safeTitle) ?? 0;
+            titleCounts.set(safeTitle, count + 1);
+        }
+        const titleSeen = new Map<string, number>();
+
+        for (const item of targetItems) {
+            const safeTitle = (item.data.title || 'untitled').replace(/[^a-z0-9\-_]/gi, '_').replace(/^_+|_+$/g, '').substring(0, 60) || 'untitled';
+            const isDuplicate = (titleCounts.get(safeTitle) ?? 0) > 1;
+            const seq = (titleSeen.get(safeTitle) ?? 0) + 1;
+            titleSeen.set(safeTitle, seq);
+            const filename = isDuplicate ? `${safeTitle}_${seq}` : safeTitle;
 
             if (format === 'markdown') {
-                const content = exportToMarkdown(item.data);
+                const content = exportToMarkdown(item.data, { artifactMode: captureMetadataOptions.artifactMode });
                 zip.file(`${filename}.md`, content);
             } else if (format === 'json') {
                 const content = exportToJSON(item.data);
                 zip.file(`${filename}.json`, content);
+            } else if (format === 'html') {
+                const content = exportToHtml(item.data);
+                zip.file(`${filename}.html`, content);
+            } else if (format === 'bonsai') {
+                const content = JSON.stringify(toBonsaiImportPackage(item.data), null, 2);
+                zip.file(`${filename}.bonsai.json`, content);
             }
         }
 
@@ -1083,6 +1668,12 @@ export function SidePanel() {
                 >
                     Bulk
                 </button>
+                <button
+                    className={`tab ${activeTab === 'settings' ? 'active' : ''}`}
+                    onClick={() => setActiveTab('settings')}
+                >
+                    ⚙️
+                </button>
             </nav>
 
 
@@ -1102,12 +1693,26 @@ export function SidePanel() {
                                             </span>
                                             <button
                                                 className="btn-icon-tiny"
-                                                onClick={() => {
-                                                    chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
-                                                        if (tab?.id) chrome.tabs.sendMessage(tab.id, { type: 'REFRESH_DIAGNOSTICS' });
-                                                    });
-                                                    // Optimistic update
+                                                onClick={async () => {
+                                                    // Force-refresh: re-query diagnostics AND re-capture
                                                     setDiagnostics(null);
+                                                    try {
+                                                        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+                                                        if (!tab?.id) return;
+                                                        // Re-fetch diagnostics
+                                                        const diag = await chrome.tabs.sendMessage(tab.id, { type: 'GET_DIAGNOSTICS' }).catch(() => null);
+                                                        if (diag) setDiagnostics(diag);
+                                                        // Re-capture so the panel shows current content
+                                                        const response = await chrome.tabs.sendMessage(tab.id, {
+                                                            type: 'CAPTURE',
+                                                            scope: 'entire',
+                                                            providerCaptureSettings,
+                                                        }).catch(() => null);
+                                                        if (response?.data) {
+                                                            const preparedGraph = applyCaptureMetadataOptions(response.data);
+                                                            loadCaptureIntoEditor(preparedGraph);
+                                                        }
+                                                    } catch { /* content script not ready */ }
                                                 }}
                                                 title="Refresh Connection"
                                                 style={{
@@ -1134,7 +1739,7 @@ export function SidePanel() {
                                     </div>
                                     <div className="diagnostics-row">
                                         <span className="label">Artifacts</span>
-                                        <span className="value">{diagnostics.artifactCount ?? 0}</span>
+                                        <span className="value">{currentCapture?.artifacts?.length ?? diagnostics.artifactCount ?? 0}</span>
                                     </div>
                                 </>
                             ) : (
@@ -1145,10 +1750,31 @@ export function SidePanel() {
                                             <span className="value warning">⏳ Connecting...</span>
                                             <button
                                                 className="btn-icon-tiny"
-                                                onClick={() => {
-                                                    chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
-                                                        if (tab?.id) chrome.tabs.sendMessage(tab.id, { type: 'REFRESH_DIAGNOSTICS' });
-                                                    });
+                                                onClick={async () => {
+                                                    setDiagnostics(null);
+                                                    try {
+                                                        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+                                                        if (!tab?.id || !tab.url) return;
+
+                                                        // First try normal diagnostics check
+                                                        let diag = await chrome.tabs.sendMessage(tab.id, { type: 'GET_DIAGNOSTICS' }).catch(() => null);
+
+                                                        if (!diag) {
+                                                            // Content script not loaded — ask background to re-inject
+                                                            await chrome.runtime.sendMessage({
+                                                                type: 'REINJECT_CONTENT_SCRIPT',
+                                                                tabId: tab.id,
+                                                                url: tab.url,
+                                                            }).catch(() => null);
+
+                                                            // Wait for content script to initialize
+                                                            await new Promise(r => setTimeout(r, 1500));
+
+                                                            diag = await chrome.tabs.sendMessage(tab.id, { type: 'GET_DIAGNOSTICS' }).catch(() => null);
+                                                        }
+
+                                                        if (diag) setDiagnostics(diag);
+                                                    } catch { /* content script not ready */ }
                                                 }}
                                                 title="Retry Connection"
                                                 style={{
@@ -1178,35 +1804,64 @@ export function SidePanel() {
                             <EditorContent editor={editor} className="editor" />
                         </div>
 
-                        <div className="capture-metadata-panel">
-                            <div className="capture-metadata-title">Capture Metadata</div>
-                            <label className="capture-metadata-option">
-                                <input
-                                    type="checkbox"
-                                    checked={captureMetadataOptions.includeTimestamps}
-                                    onChange={() => handleToggleCaptureMetadataOption('includeTimestamps')}
-                                />
-                                <span>Per-message timestamps</span>
-                            </label>
-                            <label className="capture-metadata-option">
-                                <input
-                                    type="checkbox"
-                                    checked={captureMetadataOptions.includeModels}
-                                    onChange={() => handleToggleCaptureMetadataOption('includeModels')}
-                                />
-                                <span>Per-message model metadata</span>
-                            </label>
-                            <label className="capture-metadata-option">
-                                <input
-                                    type="checkbox"
-                                    checked={captureMetadataOptions.includeAnchors}
-                                    onChange={() => handleToggleCaptureMetadataOption('includeAnchors')}
-                                />
-                                <span>Message jump links / deep links</span>
-                            </label>
-                            <div className="capture-metadata-hint">
-                                                Applies to inline insert, Capture All, and Bulk captures. The capture header keeps the conversation timestamp and provider.
+                        <div className="capture-settings-row">
+                            <div className="capture-metadata-panel">
+                                <div className="capture-metadata-title">Metadata</div>
+                                <label className="capture-metadata-option">
+                                    <input
+                                        type="checkbox"
+                                        checked={captureMetadataOptions.includeTimestamps}
+                                        onChange={() => handleToggleCaptureMetadataOption('includeTimestamps')}
+                                    />
+                                    <span>Timestamps</span>
+                                </label>
+                                <label className="capture-metadata-option">
+                                    <input
+                                        type="checkbox"
+                                        checked={captureMetadataOptions.includeModels}
+                                        onChange={() => handleToggleCaptureMetadataOption('includeModels')}
+                                    />
+                                    <span>Model info</span>
+                                </label>
+                                <label className="capture-metadata-option">
+                                    <input
+                                        type="checkbox"
+                                        checked={captureMetadataOptions.includeAnchors}
+                                        onChange={() => handleToggleCaptureMetadataOption('includeAnchors')}
+                                    />
+                                    <span>Deep links</span>
+                                </label>
                             </div>
+                            <div className="capture-metadata-panel">
+                                <div className="capture-metadata-title">Artifacts</div>
+                                <label className="capture-metadata-option">
+                                    <input
+                                        type="checkbox"
+                                        checked={captureMetadataOptions.includeArtifacts}
+                                        onChange={() => handleToggleCaptureMetadataOption('includeArtifacts')}
+                                    />
+                                    <span>Include artifacts</span>
+                                </label>
+                                {captureMetadataOptions.includeArtifacts && (
+                                    <div className="artifact-mode-toggle">
+                                        <button
+                                            className={`artifact-mode-btn ${captureMetadataOptions.artifactMode === 'inline' ? 'active' : ''}`}
+                                            onClick={() => handleSetArtifactMode('inline')}
+                                        >
+                                            Inline
+                                        </button>
+                                        <button
+                                            className={`artifact-mode-btn ${captureMetadataOptions.artifactMode === 'appendix' ? 'active' : ''}`}
+                                            onClick={() => handleSetArtifactMode('appendix')}
+                                        >
+                                            Appendix
+                                        </button>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                        <div className="capture-metadata-hint">
+                            Applies to inline insert, Capture All, and Bulk captures.
                         </div>
 
                         {isClaudeProvider && (
@@ -1341,6 +1996,7 @@ export function SidePanel() {
                                                 key={key}
                                                 groupKey={key}
                                                 group={group}
+                                                markdownOptions={{ artifactMode: captureMetadataOptions.artifactMode }}
                                                 onSelectMarkdown={(markdown, mergedItem, batchItems) => {
                                                     setExportBatch(batchItems);
                                                     if (editor) {
@@ -1477,11 +2133,49 @@ export function SidePanel() {
                                     </button>
                                     <button
                                         className="btn btn-secondary"
+                                        onClick={() => handleExport('html')}
+                                        disabled={!!exportBatch}
+                                    >
+                                        🌐 HTML
+                                    </button>
+                                    <button
+                                        className="btn btn-secondary"
                                         onClick={() => handleExport('toon')}
                                         disabled={!!exportBatch}
                                     >
                                         🌳 TOON
                                     </button>
+                                    <button
+                                        className="btn btn-secondary"
+                                        onClick={() => handleExport('bonsai')}
+                                        disabled={!!exportBatch}
+                                        title="Export as .bonsai.json — importable via Bonsai WebUI or CLI"
+                                    >
+                                        🌿 Bonsai
+                                    </button>
+                                </div>
+
+                                {/* Send to Bonsai — single */}
+                                <div style={{ marginTop: '16px', borderTop: '1px solid var(--border-color)', paddingTop: '12px', opacity: exportBatch ? 0.4 : 1, pointerEvents: exportBatch ? 'none' : 'auto' }}>
+                                    <button
+                                        className="btn btn-primary"
+                                        onClick={handleImportToBonsai}
+                                        disabled={!!exportBatch || isImporting || !isBonsaiConfigured}
+                                        style={{ width: '100%' }}
+                                        title={!isBonsaiConfigured ? 'Configure Bonsai connection in Settings tab' : 'Send this conversation to your Bonsai instance'}
+                                    >
+                                        {isImporting ? '⏳ Sending...' : '🌿 Send to Bonsai'}
+                                    </button>
+                                    {!isBonsaiConfigured && (
+                                        <div style={{ fontSize: '11px', color: 'var(--text-secondary)', marginTop: '6px', textAlign: 'center' }}>
+                                            <button
+                                                style={{ background: 'none', border: 'none', color: 'var(--accent-primary)', cursor: 'pointer', textDecoration: 'underline', fontSize: '11px', padding: 0 }}
+                                                onClick={() => setActiveTab('settings')}
+                                            >
+                                                Connect to Bonsai
+                                            </button> to enable direct import
+                                        </div>
+                                    )}
                                 </div>
                             </>
                         )}
@@ -1512,7 +2206,74 @@ export function SidePanel() {
                                     >
                                         📦 ZIP (JSON)
                                     </button>
+                                    <button
+                                        className="btn btn-secondary"
+                                        onClick={() => handleBulkExport('html', exportBatch)}
+                                        title={`Download ${exportBatch.length} items as ZIP (HTML)`}
+                                    >
+                                        📦 ZIP (HTML)
+                                    </button>
+                                    <button
+                                        className="btn btn-secondary"
+                                        onClick={() => handleBulkExport('bonsai', exportBatch)}
+                                        title={`Download ${exportBatch.length} items as ZIP (Bonsai Import)`}
+                                    >
+                                        📦 ZIP (Bonsai)
+                                    </button>
                                 </div>
+
+                                {/* Batch Send to Bonsai */}
+                                <div style={{ marginTop: '12px' }}>
+                                    <button
+                                        className="btn btn-primary"
+                                        onClick={() => handleBulkImportToBonsai(exportBatch)}
+                                        disabled={isImporting || !isBonsaiConfigured}
+                                        style={{ width: '100%' }}
+                                        title={!isBonsaiConfigured ? 'Configure Bonsai connection in Settings tab' : `Send ${exportBatch.length} conversations to Bonsai`}
+                                    >
+                                        {isImporting && importProgress
+                                            ? `⏳ Sending ${importProgress.current}/${importProgress.total}...`
+                                            : `🌿 Send ${exportBatch.length} to Bonsai`}
+                                    </button>
+                                </div>
+
+                                {/* Import log */}
+                                {importLog && importLog.some(e => !e.success) && (
+                                    <div style={{ marginTop: '12px', border: '1px solid var(--border-color)', borderRadius: '6px', overflow: 'hidden' }}>
+                                        <div style={{
+                                            display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                                            padding: '8px 10px', background: 'var(--bg-secondary)', borderBottom: '1px solid var(--border-color)',
+                                        }}>
+                                            <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-primary)' }}>
+                                                Import Log — {importLog.filter(e => !e.success).length} failed
+                                            </span>
+                                            <button
+                                                onClick={() => setImportLog(null)}
+                                                style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)', fontSize: '14px', padding: '0 4px' }}
+                                            >
+                                                ✕
+                                            </button>
+                                        </div>
+                                        <div style={{ maxHeight: '200px', overflowY: 'auto', padding: '4px 0' }}>
+                                            {importLog.filter(e => !e.success).map((entry, i) => (
+                                                <div key={i} style={{
+                                                    display: 'flex', gap: '8px', alignItems: 'flex-start',
+                                                    padding: '4px 10px', fontSize: '11px',
+                                                }}>
+                                                    <span style={{ color: '#ef4444', flexShrink: 0 }}>✗</span>
+                                                    <div style={{ minWidth: 0 }}>
+                                                        <div style={{ fontWeight: 500, color: 'var(--text-primary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                                                            {entry.title}
+                                                        </div>
+                                                        <div style={{ color: 'var(--text-secondary)', wordBreak: 'break-word' }}>
+                                                            {entry.error}
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
                             </div>
                         )}
                     </div>
@@ -1520,112 +2281,229 @@ export function SidePanel() {
 
                 {activeTab === 'bulk' && (
                     <div className="bulk-panel" style={{ padding: '16px' }}>
-                        <div className="bulk-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                        <div className="bulk-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
                             <h3 style={{ margin: 0 }}>Bulk Capture</h3>
-                            <button
-                                className="btn btn-secondary"
-                                onClick={handleScanSidebar}
-                                disabled={isBulkCapturing}
-                                style={{ padding: '4px 8px', fontSize: '12px' }}
-                            >
-                                {isBulkScanning ? 'Scanning...' : 'Scan Sidebar'}
-                            </button>
+                            <div style={{ display: 'flex', gap: '6px' }}>
+                                <button
+                                    className="btn btn-secondary"
+                                    onClick={discoverProjectsForScope}
+                                    disabled={isBulkCapturing || isBulkScanning}
+                                    style={{ padding: '4px 8px', fontSize: '12px' }}
+                                    title="Re-discover projects from sidebar"
+                                >
+                                    {isDiscoveringProjects ? '⟳' : '⟳ Projects'}
+                                </button>
+                                <button
+                                    className="btn btn-secondary"
+                                    onClick={handleScan}
+                                    disabled={isBulkCapturing || isBulkScanning || (!scopeIncludeSidebar && scopeProjectUrls.size === 0)}
+                                    style={{ padding: '4px 8px', fontSize: '12px' }}
+                                >
+                                    {isBulkScanning ? 'Scanning...' : 'Scan'}
+                                </button>
+                            </div>
                         </div>
 
-                        <div className="bulk-config" style={{ marginBottom: '16px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-                            <label style={{ fontSize: '12px' }}>
-                                Limit
+                        {/* Scan scope checkboxes */}
+                        <div style={{ marginBottom: '12px', padding: '10px', background: 'var(--bg-secondary)', borderRadius: '6px', border: '1px solid var(--border-color)' }}>
+                            <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                                Scan Scope
+                            </div>
+                            {/* Sidebar */}
+                            <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', cursor: 'pointer', marginBottom: '4px', color: 'var(--text-primary)' }}>
                                 <input
-                                    type="number"
-                                    value={bulkLimit}
-                                    onChange={e => setBulkLimit(Number(e.target.value))}
-                                    min="1" max="500"
-                                    className="input"
-                                    style={{ width: '100%', marginTop: '4px' }}
+                                    type="checkbox"
+                                    checked={scopeIncludeSidebar}
+                                    onChange={e => setScopeIncludeSidebar(e.target.checked)}
+                                    disabled={isBulkCapturing || isBulkScanning}
                                 />
+                                💬 Chat History
                             </label>
-                            <label style={{ fontSize: '12px' }}>
-                                Delay (ms)
-                                <input
-                                    type="number"
-                                    value={bulkDelay}
-                                    onChange={e => setBulkDelay(Number(e.target.value))}
-                                    step="500"
-                                    className="input"
-                                    style={{ width: '100%', marginTop: '4px' }}
-                                />
-                            </label>
-                        </div>
-
-                        <div style={{ marginBottom: '16px' }}>
-                            {bulkItems.length > 0 && (
-                                <div style={{ marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                    <input
-                                        type="checkbox"
-                                        id="select-all-bulk"
-                                        checked={bulkItems.every(i => i.selected)}
-                                        onChange={(e) => {
-                                            const checked = e.target.checked;
-                                            setBulkItems(items => items.map(i => ({ ...i, selected: checked })));
-                                        }}
-                                        disabled={isBulkCapturing}
-                                    />
-                                    <label htmlFor="select-all-bulk" style={{ cursor: 'pointer', fontSize: '13px', userSelect: 'none', color: 'var(--text-primary)' }}>
-                                        Select All ({bulkItems.filter(i => i.selected).length})
-                                    </label>
+                            {/* One checkbox per discovered project */}
+                            {availableProjects.length === 0 && !isDiscoveringProjects && (
+                                <div style={{ fontSize: '12px', color: 'var(--text-secondary)', paddingLeft: '4px' }}>
+                                    No projects found in sidebar. Open ChatGPT with projects visible, then click ⟳ Projects.
                                 </div>
                             )}
+                            {isDiscoveringProjects && (
+                                <div style={{ fontSize: '12px', color: 'var(--text-secondary)', paddingLeft: '4px' }}>Discovering projects…</div>
+                            )}
+                            {availableProjects.map(p => (
+                                <label key={p.url} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', cursor: 'pointer', marginBottom: '4px', color: 'var(--text-primary)' }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={scopeProjectUrls.has(p.url)}
+                                        onChange={e => {
+                                            setScopeProjectUrls(prev => {
+                                                const next = new Set(prev);
+                                                if (e.target.checked) next.add(p.url);
+                                                else next.delete(p.url);
+                                                return next;
+                                            });
+                                        }}
+                                        disabled={isBulkCapturing || isBulkScanning}
+                                    />
+                                    📁 {p.name}
+                                </label>
+                            ))}
                         </div>
 
-                        <div className="bulk-list" style={{
-                            border: '1px solid var(--border-color)',
-                            borderRadius: '4px',
-                            height: '300px',
-                            overflowY: 'auto',
-                            marginBottom: '16px',
-                            backgroundColor: 'var(--bg-secondary)'
-                        }}>
-                            {bulkItems.length === 0 ? (
-                                <div className="empty-state" style={{ padding: '20px', textAlign: 'center', color: 'var(--text-secondary)' }}>
-                                    No conversations found. <br />Click Scan to list sidebar items.
-                                </div>
-                            ) : (
-                                bulkItems.map(item => (
-                                    <div key={item.id} className={`bulk-item ${item.status}`} style={{
-                                        padding: '8px',
-                                        borderBottom: '1px solid var(--border-color)',
-                                        display: 'flex',
-                                        alignItems: 'center',
-                                        gap: '8px',
-                                        background: 'var(--bg-primary)',
-                                        color: 'var(--text-primary)'
-                                    }}>
+                        <div className="bulk-config" style={{ marginBottom: '12px' }}>
+                        </div>
+
+                        {/* ---- Sectioned bulk list ---- */}
+                        {(() => {
+                            // Partition into project sections + one "Chat History" section
+                            const projectNames = Array.from(
+                                new Set(
+                                    bulkItems
+                                        .map(i => i.projectName)
+                                        .filter((n): n is string => Boolean(n))
+                                )
+                            ).sort((a, b) => a.localeCompare(b));
+
+                            const historyItems = bulkItems.filter(i => !i.projectName);
+
+                            const renderSelectAll = (sectionItems: BulkItem[], sectionKey: string, label: string) => {
+                                const allSelected = sectionItems.length > 0 && sectionItems.every(i => i.selected);
+                                const someSelected = sectionItems.some(i => i.selected);
+                                const selectedCount = sectionItems.filter(i => i.selected).length;
+                                return (
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                                         <input
                                             type="checkbox"
-                                            checked={item.selected}
-                                            onChange={() => {
-                                                setBulkItems(items => items.map(i =>
-                                                    i.id === item.id ? { ...i, selected: !i.selected } : i
-                                                ));
+                                            id={`select-all-${sectionKey}`}
+                                            checked={allSelected}
+                                            ref={(el) => {
+                                                if (el) el.indeterminate = !allSelected && someSelected;
+                                            }}
+                                            onChange={(e) => {
+                                                const checked = e.target.checked;
+                                                setBulkItems(items =>
+                                                    items.map(i =>
+                                                        sectionItems.some(s => s.id === i.id)
+                                                            ? { ...i, selected: checked }
+                                                            : i
+                                                    )
+                                                );
                                             }}
                                             disabled={isBulkCapturing}
                                         />
-                                        <span
-                                            className="bulk-item-title"
-                                            title={item.title}
-                                            style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', fontSize: '13px' }}
+                                        <label
+                                            htmlFor={`select-all-${sectionKey}`}
+                                            style={{ cursor: 'pointer', fontSize: '12px', fontWeight: 600, userSelect: 'none', color: 'var(--text-secondary)' }}
                                         >
-                                            {item.title}
-                                        </span>
-                                        <span className="bulk-item-status" style={{ fontSize: '12px' }}>
-                                            {item.status === 'success' && '✅'}
-                                            {item.status === 'error' && '❌'}
-                                            {item.status === 'capturing' && '⏳'}
-                                        </span>
+                                            {label} ({selectedCount}/{sectionItems.length})
+                                        </label>
                                     </div>
-                                ))
-                            )}
-                        </div>
+                                );
+                            };
+
+                            const renderItem = (item: BulkItem) => (
+                                <div key={item.id} className={`bulk-item ${item.status}`} style={{
+                                    padding: '6px 8px',
+                                    borderBottom: '1px solid var(--border-color)',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '8px',
+                                    background: 'var(--bg-primary)',
+                                    color: 'var(--text-primary)'
+                                }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={item.selected}
+                                        onChange={() =>
+                                            setBulkItems(items =>
+                                                items.map(i => i.id === item.id ? { ...i, selected: !i.selected } : i)
+                                            )
+                                        }
+                                        disabled={isBulkCapturing}
+                                    />
+                                    <span
+                                        className="bulk-item-title"
+                                        title={item.title}
+                                        style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', fontSize: '13px' }}
+                                    >
+                                        {item.title}
+                                    </span>
+                                    <span
+                                        className="bulk-item-status"
+                                        title={item.status === 'error'
+                                            ? (item.failureReason ?? 'Capture failed')
+                                            : item.status === 'capturing'
+                                                ? 'Capture in progress'
+                                                : item.status === 'success'
+                                                    ? 'Capture completed'
+                                                    : 'Pending capture'
+                                        }
+                                        style={{ fontSize: '12px', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                                    >
+                                        {item.status === 'success' && '✅'}
+                                        {item.status === 'error' && (
+                                            <span title={item.failureReason ?? 'Capture failed'} style={{ cursor: 'help' }}>❌</span>
+                                        )}
+                                        {item.status === 'error' && item.failureReason && (
+                                            <span title={item.failureReason} style={{ cursor: 'help', opacity: 0.75 }}>ℹ️</span>
+                                        )}
+                                        {item.status === 'capturing' && '⏳'}
+                                    </span>
+                                </div>
+                            );
+
+                            const sectionHeaderStyle: React.CSSProperties = {
+                                padding: '6px 8px 4px',
+                                background: 'var(--bg-secondary)',
+                                borderBottom: '1px solid var(--border-color)',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '8px',
+                                position: 'sticky',
+                                top: 0,
+                                zIndex: 1,
+                            };
+
+                            return (
+                                <div className="bulk-list" style={{
+                                    border: '1px solid var(--border-color)',
+                                    borderRadius: '4px',
+                                    height: '320px',
+                                    overflowY: 'auto',
+                                    marginBottom: '16px',
+                                    backgroundColor: 'var(--bg-secondary)'
+                                }}>
+                                    {bulkItems.length === 0 ? (
+                                        <div className="empty-state" style={{ padding: '20px', textAlign: 'center', color: 'var(--text-secondary)' }}>
+                                            No conversations found. <br />Click Scan to list sidebar items.
+                                        </div>
+                                    ) : (
+                                        <>
+                                            {/* Project sections */}
+                                            {projectNames.map(projectName => {
+                                                const projectItems = bulkItems.filter(i => i.projectName === projectName);
+                                                return (
+                                                    <div key={`project-${projectName}`}>
+                                                        <div style={sectionHeaderStyle}>
+                                                            {renderSelectAll(projectItems, `project-${projectName}`, `📁 ${projectName}`)}
+                                                        </div>
+                                                        {projectItems.map(renderItem)}
+                                                    </div>
+                                                );
+                                            })}
+
+                                            {/* Chat History section */}
+                                            {historyItems.length > 0 && (
+                                                <div>
+                                                    <div style={sectionHeaderStyle}>
+                                                        {renderSelectAll(historyItems, 'history', '💬 Chat History')}
+                                                    </div>
+                                                    {historyItems.map(renderItem)}
+                                                </div>
+                                            )}
+                                        </>
+                                    )}
+                                </div>
+                            );
+                        })()}
 
                         <div className="bulk-actions">
                             <button
@@ -1650,6 +2528,22 @@ export function SidePanel() {
                             </button>
                         )}
 
+                        {!isBulkCapturing && bulkItems.some(i => i.status === 'success' || i.status === 'error') && (
+                            <button
+                                className="btn btn-secondary"
+                                onClick={() => {
+                                    setBulkItems(prev => prev.map(i => ({
+                                        ...i,
+                                        status: 'pending' as const,
+                                        failureReason: undefined
+                                    })));
+                                }}
+                                style={{ width: '100%', marginTop: '8px' }}
+                            >
+                                Clear Results
+                            </button>
+                        )}
+
                         <div style={{ marginTop: '12px', paddingTop: '10px', borderTop: '1px solid var(--border-color)', fontSize: '11px', color: 'var(--text-secondary)', lineHeight: '1.5' }}>
                             <strong>Provider export:</strong>{' '}
                             <a href="https://help.openai.com/en/articles/7260999-how-do-i-export-my-chatgpt-history-and-data" target="_blank" rel="noreferrer" style={{ color: 'var(--accent-primary)' }}>ChatGPT</a>,{' '}
@@ -1658,7 +2552,126 @@ export function SidePanel() {
                         </div>
                     </div>
                 )}
+
+                {activeTab === 'settings' && (
+                    <div className="settings-panel" style={{ padding: '16px' }}>
+                        <h3 style={{ margin: '0 0 16px 0', color: 'var(--text-primary)' }}>🌿 Bonsai Connection</h3>
+
+                        <div style={{ marginBottom: '16px' }}>
+                            <label style={{ display: 'block', fontSize: '12px', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '4px' }}>
+                                Bonsai Host URL
+                            </label>
+                            <input
+                                type="url"
+                                value={bonsaiHost}
+                                onChange={(e) => setBonsaiHost(e.target.value)}
+                                placeholder="http://localhost:3000"
+                                style={{
+                                    width: '100%',
+                                    padding: '8px 10px',
+                                    borderRadius: '4px',
+                                    border: '1px solid var(--border-color)',
+                                    background: 'var(--bg-primary)',
+                                    color: 'var(--text-primary)',
+                                    fontSize: '13px',
+                                    boxSizing: 'border-box',
+                                }}
+                            />
+                        </div>
+
+                        <div style={{ marginBottom: '16px' }}>
+                            <label style={{ display: 'block', fontSize: '12px', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '4px' }}>
+                                API Key
+                            </label>
+                            <input
+                                type="password"
+                                value={bonsaiApiKey}
+                                onChange={(e) => setBonsaiApiKey(e.target.value)}
+                                placeholder="Enter your Bonsai API key"
+                                style={{
+                                    width: '100%',
+                                    padding: '8px 10px',
+                                    borderRadius: '4px',
+                                    border: '1px solid var(--border-color)',
+                                    background: 'var(--bg-primary)',
+                                    color: 'var(--text-primary)',
+                                    fontSize: '13px',
+                                    boxSizing: 'border-box',
+                                }}
+                            />
+                            <div style={{ fontSize: '11px', color: 'var(--text-secondary)', marginTop: '4px' }}>
+                                Generate an API key in Bonsai WebUI → Settings → Extensions
+                            </div>
+                        </div>
+
+                        <button
+                            className="btn btn-primary"
+                            onClick={handleSaveSettings}
+                            style={{ width: '100%', marginBottom: '16px' }}
+                        >
+                            💾 Save Settings
+                        </button>
+
+                        <div style={{
+                            padding: '10px',
+                            borderRadius: '4px',
+                            background: isBonsaiConfigured ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)',
+                            border: `1px solid ${isBonsaiConfigured ? 'rgba(34, 197, 94, 0.3)' : 'rgba(239, 68, 68, 0.3)'}`,
+                            fontSize: '12px',
+                            color: 'var(--text-primary)',
+                        }}>
+                            <strong>Status:</strong>{' '}
+                            {isBonsaiConfigured
+                                ? `✅ Connected to ${bonsaiHost}`
+                                : '❌ Not connected — enter your Bonsai host URL and API key above'}
+                        </div>
+
+                        <div style={{ marginTop: '24px', borderTop: '1px solid var(--border-color)', paddingTop: '16px' }}>
+                            <h3 style={{ margin: '0 0 12px 0', color: 'var(--text-primary)', fontSize: '14px' }}>Auto-Connect</h3>
+                            <div style={{ fontSize: '12px', color: 'var(--text-secondary)', lineHeight: '1.5' }}>
+                                You can also connect automatically from the Bonsai WebUI.
+                                Open <strong>Settings → Extensions</strong> in Bonsai and click <strong>Connect Extension</strong>.
+                                The WebUI will send your host and API key directly to this extension.
+                            </div>
+                        </div>
+                    </div>
+                )}
             </div>
+
+            {/* Import progress overlay */}
+            {isImporting && (
+                <div style={{
+                    position: 'fixed',
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    background: 'rgba(0, 0, 0, 0.5)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    zIndex: 1000,
+                }}>
+                    <div style={{
+                        background: 'var(--bg-primary)',
+                        padding: '24px',
+                        borderRadius: '8px',
+                        border: '1px solid var(--border-color)',
+                        textAlign: 'center',
+                        minWidth: '200px',
+                    }}>
+                        <div style={{ fontSize: '24px', marginBottom: '8px' }}>🌿</div>
+                        <div style={{ fontWeight: 600, color: 'var(--text-primary)', marginBottom: '8px' }}>
+                            Sending to Bonsai...
+                        </div>
+                        {importProgress && (
+                            <div style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
+                                {importProgress.current} / {importProgress.total}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )}
         </div >
     );
 }

@@ -16,6 +16,60 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 
 // Listen for messages from content scripts
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    // =========================================================================
+    // Bonsai WebUI Bridge — config sync from the bonsai_webui content script
+    // =========================================================================
+    if (message.type === 'UPDATE_CONFIG') {
+        const { host, apiKey } = message.payload ?? {};
+        if (host && apiKey) {
+            chrome.storage.local.set({ bonsaiHost: host, bonsaiApiKey: apiKey }, () => {
+                sendResponse({ success: true });
+            });
+        } else {
+            sendResponse({ success: false, error: 'Missing host or apiKey' });
+        }
+        return true; // async sendResponse
+    }
+
+    // =========================================================================
+    // Send-to-Bonsai — POSTs a BonsaiImportPackage to the configured backend
+    // =========================================================================
+    if (message.type === 'SEND_TO_BONSAI') {
+        (async () => {
+            try {
+                const storage = await chrome.storage.local.get(['bonsaiHost', 'bonsaiApiKey']);
+                const host = storage.bonsaiHost;
+                const apiKey = storage.bonsaiApiKey;
+
+                if (!host || !apiKey) {
+                    sendResponse({ success: false, error: 'Bonsai is not configured. Connect in the Settings tab.' });
+                    return;
+                }
+
+                const response = await fetch(`${host}/api/import/conversation`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `ApiKey ${apiKey}`,
+                    },
+                    body: JSON.stringify(message.payload),
+                });
+
+                if (!response.ok) {
+                    const text = await response.text();
+                    sendResponse({ success: false, error: `Import failed (${response.status}): ${text}` });
+                    return;
+                }
+
+                const result = await response.json();
+                sendResponse({ success: true, data: result });
+            } catch (error) {
+                sendResponse({ success: false, error: String(error) });
+            }
+        })();
+        return true; // async sendResponse
+    }
+
     if (message.type === 'CAPTURE_COMPLETE') {
         // Store captured data
         chrome.storage.local.get(['captures'], (result) => {
@@ -750,6 +804,44 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 });
             } catch (error) {
                 sendResponse({ snapshots: [], error: String(error) });
+            }
+        })();
+        return true;
+    }
+
+    if (message.type === 'REINJECT_CONTENT_SCRIPT') {
+        (async () => {
+            const tabId = message.tabId as number | undefined;
+            const url = message.url as string | undefined;
+            if (!tabId || !url) {
+                sendResponse({ success: false, error: 'Missing tabId or url' });
+                return;
+            }
+
+            // Determine which content script to inject based on URL
+            const scriptMap: Array<{ pattern: RegExp; files: string[] }> = [
+                { pattern: /chatgpt\.com|chat\.openai\.com/, files: ['content/chatgpt.js'] },
+                { pattern: /claude\.ai/, files: ['content/claude.js'] },
+                { pattern: /gemini\.google\.com/, files: ['content/gemini.js'] },
+                { pattern: /grok\.com/, files: ['content/grok.js'] },
+                { pattern: /jules\.google\.com/, files: ['content/jules.js'] },
+                { pattern: /localhost|127\.0\.0\.1|bonsai\.app/, files: ['content/bonsai_webui.js'] },
+            ];
+
+            const match = scriptMap.find(s => s.pattern.test(url));
+            if (!match) {
+                sendResponse({ success: false, error: 'No content script for this URL' });
+                return;
+            }
+
+            try {
+                await chrome.scripting.executeScript({
+                    target: { tabId },
+                    files: match.files,
+                });
+                sendResponse({ success: true });
+            } catch (error) {
+                sendResponse({ success: false, error: String(error) });
             }
         })();
         return true;

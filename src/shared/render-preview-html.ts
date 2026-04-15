@@ -1,6 +1,10 @@
 import type { ArtifactNode, ContentBlock, ConversationGraph, MessageNode } from './schema';
 import { markdownToHtml } from './markdown-to-html';
 
+export interface RenderConversationOptions {
+    artifactMode?: 'inline' | 'appendix';
+}
+
 const ROLE_LABELS: Record<MessageNode['role'], string> = {
     user: 'User',
     assistant: 'Assistant',
@@ -279,7 +283,11 @@ function getArtifactDownloadName(artifact: ArtifactNode): string {
     return `${baseName}.${extension}`;
 }
 
-function shouldRenderArtifactInAppendix(artifact: ArtifactNode): boolean {
+function shouldRenderArtifactInAppendix(artifact: ArtifactNode, artifactMode: 'inline' | 'appendix' = 'appendix'): boolean {
+    if (artifactMode === 'inline') {
+        return false;
+    }
+
     if (artifact.type === 'code_artifact') {
         return typeof artifact.content === 'string' && artifact.content.trim().length > 0;
     }
@@ -482,7 +490,8 @@ function renderBlock(
 function renderMessage(
     message: MessageNode,
     artifacts: ArtifactNode[],
-    providerSite: ConversationGraph['source']['provider_site']
+    providerSite: ConversationGraph['source']['provider_site'],
+    artifactMode: 'inline' | 'appendix' = 'appendix'
 ): string {
     // Skip messages with no content and no artifacts to avoid empty role headers.
     if (message.content_blocks.length === 0 && artifacts.length === 0) {
@@ -516,7 +525,8 @@ function renderMessage(
     return html;
 }
 
-export function renderConversationGraphToHtml(graph: ConversationGraph): string {
+export function renderConversationGraphToHtml(graph: ConversationGraph, options?: RenderConversationOptions): string {
+    const artifactMode = options?.artifactMode ?? 'appendix';
     const remainingArtifactIds = new Set(graph.artifacts.map((artifact) => artifact.artifact_id));
     let html = `${PREVIEW_STYLES}<h1>${escapeHtml(graph.title ?? 'Conversation')}</h1>`;
 
@@ -543,9 +553,11 @@ export function renderConversationGraphToHtml(graph: ConversationGraph): string 
 
     graph.messages.forEach((message) => {
         const messageArtifacts = graph.artifacts.filter((artifact) => artifact.source_message_id === message.message_id);
-        const inlineArtifacts = messageArtifacts.filter((artifact) => !shouldRenderArtifactInAppendix(artifact));
+        const inlineArtifacts = artifactMode === 'inline'
+            ? messageArtifacts
+            : messageArtifacts.filter((artifact) => !shouldRenderArtifactInAppendix(artifact, artifactMode));
         inlineArtifacts.forEach((artifact) => remainingArtifactIds.delete(artifact.artifact_id));
-        html += renderMessage(message, inlineArtifacts, graph.source.provider_site);
+        html += renderMessage(message, inlineArtifacts, graph.source.provider_site, artifactMode);
     });
 
     const remainingArtifacts = graph.artifacts.filter((artifact) => remainingArtifactIds.has(artifact.artifact_id));
