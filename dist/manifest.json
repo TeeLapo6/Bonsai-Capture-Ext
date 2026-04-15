@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Bonsai Capture",
   "version": "0.1.0",
-  "description": "Capture and normalize AI conversations from ChatGPT, Claude, Gemini, and Grok into the Bonsai workflow engine.",
+  "description": "Capture AI chat conversations and import them into Bonsai",
   "permissions": [
     "activeTab",
     "scripting",
@@ -19,7 +19,8 @@
       "http://localhost:3000/*",
       "http://127.0.0.1:3000/*",
       "http://localhost:8080/*",
-      "http://127.0.0.1:8080/*"
+      "http://127.0.0.1:8080/*",
+      "https://*.bonsai.app/*"
     ]
   },
   "host_permissions": [
@@ -29,8 +30,12 @@
     "https://gemini.google.com/*",
     "https://grok.com/*",
     "https://*.oaiusercontent.com/*",
+    "https://files.oaiusercontent.com/*",
     "https://*.googleusercontent.com/*",
-    "https://*.usercontent.google.com/*"
+    "https://*.ggpht.com/*",
+    "https://*.google.com/*",
+    "https://*.usercontent.google.com/*",
+    "https://jules.google.com/*"
   ],
   "background": {
     "service_worker": "background.js",
@@ -88,6 +93,21 @@
         "content/grok.js"
       ],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "http://localhost/*",
+        "http://127.0.0.1/*",
+        "http://localhost:3000/*",
+        "http://127.0.0.1:3000/*",
+        "http://localhost:8080/*",
+        "http://127.0.0.1:8080/*",
+        "https://*.bonsai.app/*"
+      ],
+      "js": [
+        "content/bonsai_webui.js"
+      ],
+      "run_at": "document_start"
     }
   ],
   "action": {
