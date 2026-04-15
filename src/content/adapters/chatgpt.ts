@@ -75,9 +75,7 @@ class ChatGPTAdapter extends BaseAdapter {
         if (!container && !isProjectPage) return null;
 
         // Extract title from page or heading
-        const title = document.title.replace(' - ChatGPT', '').replace('ChatGPT', '').trim()
-            || this.extractConversationTitle()
-            || (isProjectPage ? 'Project Overview' : 'Untitled');
+        const title = this.resolveCurrentConversationTitle(isProjectPage ? 'Project Overview' : 'Untitled');
 
         return {
             url: window.location.href,
@@ -87,9 +85,139 @@ class ChatGPTAdapter extends BaseAdapter {
     }
 
     private extractConversationTitle(): string {
-        // Try to get from sidebar active item
-        const activeItem = document.querySelector('[data-testid="history-item"].active, .conversation-item.selected');
-        return activeItem?.textContent?.trim() ?? '';
+        // Only use DOM elements that reliably represent the sidebar/heading for the
+        // *current* conversation. Do NOT use main h1/h2 — those are message content
+        // headings (e.g. "Current Bolt.new Limitation") which are indistinguishable
+        // from the page structural title.
+        const candidates = [
+            document.querySelector('[aria-current="page"][href*="/c/"]'),
+            document.querySelector('[data-testid="history-item"].active'),
+            document.querySelector('.conversation-item.selected'),
+            document.querySelector('[data-testid*="conversation-title"]'),
+        ];
+
+        for (const candidate of candidates) {
+            const title = candidate?.textContent?.trim();
+            if (title && !/^(chatgpt|untitled|new chat|project overview)$/i.test(title)) {
+                return title;
+            }
+        }
+
+        return '';
+    }
+
+    private resolveCurrentConversationTitle(fallback: string): string {
+        // document.title is the most reliable source — ChatGPT always sets it to the
+        // conversation name (e.g. "Core Telemetry Categories - ChatGPT").
+        // Prefer it over DOM heuristics which can pick up message-content headings.
+        const documentTitle = document.title
+            .replace(/\s*-\s*ChatGPT.*$/i, '')
+            .replace(/^ChatGPT\s*$/i, '')
+            .trim();
+
+        return documentTitle || this.extractConversationTitle() || fallback;
+    }
+
+    private delay(ms: number): Promise<void> {
+        return new Promise((resolve) => window.setTimeout(resolve, ms));
+    }
+
+    private getConversationFingerprint(): string {
+        const messageElements = this.listMessages();
+
+        if (messageElements.length === 0) {
+            return '';
+        }
+
+        return messageElements.map((messageElement, index) => {
+            const snippet = this.cleanArtifactText(messageElement.textContent ?? '')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .slice(0, 120);
+
+            return [
+                index,
+                messageElement.getAttribute('data-message-id') ?? '',
+                messageElement.getAttribute('data-bonsai-msg-id') ?? '',
+                messageElement.getAttribute('id') ?? '',
+                messageElement.getAttribute('data-message-author-role') ?? '',
+                snippet,
+            ].join(':');
+        }).join('|');
+    }
+
+    private async waitForConversationReady(targetId: string, baselineFingerprint: string, timeoutMs = 15000): Promise<boolean> {
+        const deadline = Date.now() + timeoutMs;
+        // Empty targetId means "just wait for any stable content at the current URL" (used by
+        // the already-at-URL path after a full page reload).
+        const targetPath = targetId ? `/c/${targetId}` : null;
+        // Stabilisation: fingerprint must be non-empty, different from baseline, and unchanged
+        // for stabilizeMs before we declare the conversation fully loaded.  Without this the
+        // function returned as soon as the *first* message skeleton appeared and the capture
+        // fired against a half-rendered page.
+        const stabilizeMs = 1200;
+        let lastFingerprint = '';
+        let lastChangeAt = 0;
+
+        while (Date.now() < deadline) {
+            const currentUrl = window.location.href;
+            const fingerprint = this.getConversationFingerprint();
+            const contentReady = this.hasRenderedMessageContent();
+
+            const urlOk = targetPath === null || currentUrl.includes(targetPath);
+            if (urlOk && fingerprint && fingerprint !== baselineFingerprint && contentReady) {
+                if (fingerprint !== lastFingerprint) {
+                    // Content is still changing — reset the stability clock.
+                    lastFingerprint = fingerprint;
+                    lastChangeAt = Date.now();
+                } else if (Date.now() - lastChangeAt >= stabilizeMs) {
+                    // Fingerprint has been stable long enough — content is fully rendered.
+                    return true;
+                }
+            }
+
+            await this.delay(200);
+        }
+
+        return false;
+    }
+
+    /**
+     * Lightweight, read-only check: do any assistant message elements contain
+     * actual rendered text content (not just skeleton labels)?
+     *
+     * Safe to call on every 200 ms poll iteration because it never mutates the
+     * DOM — unlike parseContentBlocks / extractCodeBlocks which stamp
+     * data-bonsai-index attributes on live elements.
+     */
+    private hasRenderedMessageContent(): boolean {
+        const messages = this.listMessages();
+        if (messages.length === 0) return false;
+
+        const contentSelectors =
+            '.markdown, .message-content, [data-message-content], ' +
+            '[data-testid="message-content"], .chat-message-text, .text-base';
+
+        let foundAssistant = false;
+
+        for (const msg of messages) {
+            const role = msg.getAttribute('data-message-author-role') ?? '';
+            if (role !== 'assistant') continue;
+            foundAssistant = true;
+
+            const bubble = this.resolveMessageBubble(msg);
+            const contentArea = bubble.querySelector(contentSelectors);
+            if (contentArea) {
+                const text = (contentArea.textContent ?? '').replace(/\s+/g, ' ').trim();
+                // Must have meaningful text — more than just "ChatGPT said:" labels
+                if (text.length > 20) return true;
+            }
+            // Image-only responses (DALL-E, etc.)
+            if (bubble.querySelector('img[src], canvas, svg')) return true;
+        }
+
+        // No assistant messages found — nothing to wait for (e.g. fresh prompt)
+        return !foundAssistant;
     }
 
     private isLikelyMessageTurn(el: Element): boolean {
@@ -97,6 +225,9 @@ class ChatGPTAdapter extends BaseAdapter {
 
         const nonMessageSelectors = ['header', 'footer', 'nav', 'aside', 'form'];
         if (nonMessageSelectors.includes(el.tagName.toLowerCase())) return false;
+
+        // Never inject into the compose/input area (textarea or ProseMirror contenteditable).
+        if (el.querySelector('[role="textbox"], textarea, [data-testid*="prompt-textarea"]')) return false;
 
         const hasRoleAttr = el.hasAttribute('data-message-author-role');
         const dataTestId = (el.getAttribute('data-testid') || '').toLowerCase();
@@ -1534,6 +1665,251 @@ class ChatGPTAdapter extends BaseAdapter {
         return null;
     }
 
+    /**
+     * Walk up from `el` to find the nearest project-section heading.
+     * ChatGPT renders project sections as collapsible `<li>` or `<div>` blocks
+     * where the heading/button text is the project name and the conversation links
+     * are children. Returns `undefined` when the link is in the regular history
+     * (i.e. not under any project section).
+     */
+    private resolveProjectName(el: Element): string | undefined {
+        let node: Element | null = el.parentElement;
+        while (node && node !== document.body) {
+            // ChatGPT uses a <li> or <div> with a button/heading child whose text is
+            // the project name. We recognise this by looking for a sibling/ancestor button
+            // or heading that contains "project" in its data-testid or aria attributes, or
+            // is the aria-label of the containing nav group.
+
+            // Pattern 1: ancestor has an aria-label that isn't "Chat history" / navigation noise
+            const ariaLabel = node.getAttribute('aria-label')?.trim();
+            if (ariaLabel && !/^(chat history|recents?|history|today|yesterday|previous \d|last \d)/i.test(ariaLabel)) {
+                return ariaLabel;
+            }
+
+            // Pattern 2: adjacent/previous-sibling heading or button inside the same container
+            const heading = node.querySelector<HTMLElement>(
+                'button[data-testid*="project"], ' +
+                'span[data-testid*="project-name"], ' +
+                '[class*="project-name"], ' +
+                '[class*="projectName"]'
+            );
+            if (heading) {
+                const name = heading.innerText?.trim() || heading.textContent?.trim();
+                if (name && name.length > 0 && name.length < 100) return name;
+            }
+
+            // Pattern 3: li/div that has a direct button child whose text looks like a
+            // project name (not a time bucket label) immediately before the link list.
+            if (node.tagName === 'LI' || node.tagName === 'OL' || node.tagName === 'UL') {
+                const btn = node.querySelector<HTMLElement>(':scope > button, :scope > div > button');
+                if (btn) {
+                    const btnText = btn.innerText?.trim() || btn.textContent?.trim() || '';
+                    // Time bucket labels are short and date-like; skip them
+                    if (btnText.length > 2 && !/^(today|yesterday|previous \d|last \d+|\d+ days? ago)/i.test(btnText)) {
+                        return btnText;
+                    }
+                }
+            }
+
+            node = node.parentElement;
+        }
+        return undefined;
+    }
+
+    private normalizePath(url: string): string {
+        try {
+            return new URL(url, window.location.origin).pathname.replace(/\/$/, '');
+        } catch {
+            return url.split(/[?#]/)[0].replace(/\/$/, '');
+        }
+    }
+
+    private findProjectLinkByUrl(projectUrl: string): HTMLAnchorElement | null {
+        const targetPath = this.normalizePath(projectUrl);
+        const projectLinks = Array.from(document.querySelectorAll('a[href*="/g/g-p-"][href*="/project"]')) as HTMLAnchorElement[];
+        return projectLinks.find((link) => this.normalizePath(link.href || link.getAttribute('href') || '') === targetPath) ?? null;
+    }
+
+    private collectProjectConversationLinks(root?: ParentNode): HTMLAnchorElement[] {
+        const scope = root ?? document;
+        return Array.from(scope.querySelectorAll('a[href*="/c/"]')) as HTMLAnchorElement[];
+    }
+
+    private getScrollableAncestor(el: Element | null): HTMLElement | null {
+        let node: Element | null = el;
+        while (node && node !== document.body) {
+            if (node instanceof HTMLElement) {
+                const style = window.getComputedStyle(node);
+                const overflowY = style.overflowY;
+                if ((overflowY === 'auto' || overflowY === 'scroll') && node.scrollHeight > node.clientHeight + 20) {
+                    return node;
+                }
+            }
+            node = node.parentElement;
+        }
+        return null;
+    }
+
+    private getProjectConversationRoot(): HTMLElement | null {
+        const selectorRoot = this.selectors.projectConversationList
+            ? queryWithFallbacks(document, this.selectors.projectConversationList)
+            : null;
+
+        const candidates = [
+            selectorRoot,
+            document.querySelector('.project-conversations-list'),
+            document.querySelector('[data-testid*="project-conversations"]'),
+            document.querySelector('main'),
+            document.querySelector('[role="main"]'),
+        ].filter((candidate): candidate is HTMLElement => candidate instanceof HTMLElement);
+
+        return candidates.find((candidate) => this.collectProjectConversationLinks(candidate).length > 0) ?? candidates[0] ?? null;
+    }
+
+    private getProjectConversationScrollContainer(root: HTMLElement | null): HTMLElement | null {
+        if (!root) return null;
+
+        const directScrollable = this.getScrollableAncestor(root);
+        if (directScrollable) return directScrollable;
+
+        const firstLink = this.collectProjectConversationLinks(root)[0] ?? null;
+        if (firstLink) {
+            const ancestor = this.getScrollableAncestor(firstLink);
+            if (ancestor) return ancestor;
+        }
+
+        const descendants = Array.from(root.querySelectorAll('*')) as HTMLElement[];
+        return descendants.find((node) => {
+            const style = window.getComputedStyle(node);
+            return (style.overflowY === 'auto' || style.overflowY === 'scroll')
+                && node.scrollHeight > node.clientHeight + 20
+                && this.collectProjectConversationLinks(node).length > 0;
+        }) ?? (document.scrollingElement instanceof HTMLElement ? document.scrollingElement : null);
+    }
+
+    private async loadProjectPage(projectUrl: string, timeoutMs = 15000): Promise<boolean> {
+        const targetPath = this.normalizePath(projectUrl);
+
+        if (this.normalizePath(window.location.href) === targetPath) {
+            return this.waitForProjectPageReady(projectUrl, timeoutMs);
+        }
+
+        const projectLink = this.findProjectLinkByUrl(projectUrl);
+        if (!projectLink) {
+            console.warn(`[Bonsai Capture] Could not find project link in DOM: ${projectUrl}`);
+            return false;
+        }
+
+        projectLink.click();
+        return this.waitForProjectPageReady(projectUrl, timeoutMs);
+    }
+
+    private async scrollProjectConversationList(root: HTMLElement, timeoutMs = 45000): Promise<void> {
+        const scrollContainer = this.getProjectConversationScrollContainer(root);
+        const seenConversationIds = new Set<string>();
+        const deadline = Date.now() + timeoutMs;
+        let stableRounds = 0;
+        let previousScrollTop = -1;
+
+        if (scrollContainer) {
+            scrollContainer.scrollTop = 0;
+        } else {
+            window.scrollTo({ top: 0, behavior: 'auto' });
+        }
+        await this.delay(300);
+
+        while (Date.now() < deadline) {
+            let newIdsThisRound = 0;
+            for (const link of this.collectProjectConversationLinks(root)) {
+                const href = link.getAttribute('href') || link.href || '';
+                const match = href.match(/\/c\/([a-z0-9-]+)/i);
+                if (!match) continue;
+                if (!seenConversationIds.has(match[1])) {
+                    seenConversationIds.add(match[1]);
+                    newIdsThisRound += 1;
+                }
+            }
+
+            if (newIdsThisRound === 0) {
+                stableRounds += 1;
+            } else {
+                stableRounds = 0;
+            }
+
+            if (scrollContainer) {
+                const nextScrollTop = Math.min(
+                    scrollContainer.scrollTop + Math.max(320, scrollContainer.clientHeight - 120),
+                    Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight)
+                );
+
+                if (nextScrollTop === scrollContainer.scrollTop) {
+                    if (stableRounds >= 2) break;
+                } else {
+                    previousScrollTop = scrollContainer.scrollTop;
+                    scrollContainer.scrollTop = nextScrollTop;
+                }
+            } else {
+                const nextScrollTop = window.scrollY + Math.max(500, Math.floor(window.innerHeight * 0.8));
+                if (nextScrollTop === previousScrollTop && stableRounds >= 2) break;
+                previousScrollTop = window.scrollY;
+                window.scrollTo({ top: nextScrollTop, behavior: 'auto' });
+            }
+
+            if (stableRounds >= 3) break;
+            await this.delay(450);
+        }
+    }
+
+    private async scrollProjectConversationToFindLink(id: string, timeoutMs = 30000): Promise<HTMLElement | null> {
+        const root = this.getProjectConversationRoot();
+        if (!root) return null;
+
+        const initialMatch = this.collectProjectConversationLinks(root).find((link) => {
+            const href = link.href || link.getAttribute('href') || '';
+            return href.includes(`/c/${id}`);
+        });
+        if (initialMatch) return initialMatch;
+
+        const scrollContainer = this.getProjectConversationScrollContainer(root);
+        const deadline = Date.now() + timeoutMs;
+        let stableRounds = 0;
+
+        if (scrollContainer) {
+            scrollContainer.scrollTop = 0;
+        } else {
+            window.scrollTo({ top: 0, behavior: 'auto' });
+        }
+        await this.delay(250);
+
+        while (Date.now() < deadline) {
+            const found = this.collectProjectConversationLinks(root).find((link) => {
+                const href = link.href || link.getAttribute('href') || '';
+                return href.includes(`/c/${id}`);
+            });
+            if (found) return found;
+
+            let advanced = false;
+            if (scrollContainer) {
+                const nextScrollTop = Math.min(
+                    scrollContainer.scrollTop + Math.max(320, scrollContainer.clientHeight - 120),
+                    Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight)
+                );
+                advanced = nextScrollTop !== scrollContainer.scrollTop;
+                scrollContainer.scrollTop = nextScrollTop;
+            } else {
+                const nextScrollTop = window.scrollY + Math.max(500, Math.floor(window.innerHeight * 0.8));
+                advanced = nextScrollTop !== window.scrollY;
+                window.scrollTo({ top: nextScrollTop, behavior: 'auto' });
+            }
+
+            stableRounds = advanced ? 0 : stableRounds + 1;
+            if (stableRounds >= 2) break;
+            await this.delay(350);
+        }
+
+        return null;
+    }
+
     async scanSidebar(): Promise<SidebarItem[]> {
         const items: SidebarItem[] = [];
         console.log('[Bonsai Capture] Scanning for conversation links...');
@@ -1587,11 +1963,16 @@ class ChatGPTAdapter extends BaseAdapter {
 
                 // Exclude noise
                 if (id && title.toLowerCase() !== 'new chat' && title.length > 1) {
-                    items.push({
-                        id,
-                        title,
-                        url: href.startsWith('http') ? href : `https://chatgpt.com/c/${id}`
-                    });
+                    const projectName = this.resolveProjectName(link);
+                    // scanSidebar is sidebar-only: skip conversations that belong to a project.
+                    // Project conversations are collected via scanProjectConversations().
+                    if (!projectName) {
+                        items.push({
+                            id,
+                            title,
+                            url: href.startsWith('http') ? href : `https://chatgpt.com/c/${id}`,
+                        });
+                    }
                 }
             }
         });
@@ -1610,22 +1991,183 @@ class ChatGPTAdapter extends BaseAdapter {
         return uniqueItems;
     }
 
-    async loadConversation(id: string): Promise<boolean> {
-        // If already on the page
-        if (window.location.href.includes(id)) {
-            return true;
+    async discoverProjects(): Promise<import('./interface').ProjectInfo[]> {
+        // Project links in the sidebar look like:
+        //   /g/g-p-{hash}-{slug}/project
+        const projectLinks = document.querySelectorAll<HTMLAnchorElement>('a[href*="/g/g-p-"]');
+        const seen = new Set<string>();
+        const projects: import('./interface').ProjectInfo[] = [];
+
+        projectLinks.forEach(link => {
+            const href = link.getAttribute('href') || '';
+            if (!href.includes('/project')) return;
+
+            const fullUrl = href.startsWith('http') ? href : `https://chatgpt.com${href}`;
+            if (seen.has(fullUrl)) return;
+            seen.add(fullUrl);
+
+            // Name: take first non-empty text line from the link
+            let name = link.innerText?.trim() || link.textContent?.trim() || '';
+            name = name.split('\n')[0].trim();
+
+            // Fallback: extract slug from URL
+            if (!name) {
+                const slugMatch = href.match(/\/g\/g-p-[^/]+-([^/]+)\/project/);
+                name = slugMatch ? slugMatch[1].replace(/-/g, ' ') : 'Unnamed Project';
+            }
+
+            projects.push({ url: fullUrl, name });
+        });
+
+        console.log(`[Bonsai Capture] Discovered ${projects.length} projects.`);
+        return projects;
+    }
+
+    async scanProjectConversations(projectUrl: string, projectName: string): Promise<import('./interface').SidebarItem[]> {
+        console.log(`[Bonsai Capture] Scanning project: ${projectName} (${projectUrl})`);
+
+        const loaded = await this.loadProjectPage(projectUrl, 45000);
+        if (!loaded) {
+            console.warn(`[Bonsai Capture] Timed out waiting for project page: ${projectUrl}`);
+            return [];
         }
 
-        // Try to find in sidebar and click
-        const sidebarLink = document.querySelector(`a[href*="${id}"]`) as HTMLElement;
+        const root = this.getProjectConversationRoot();
+        if (!root) {
+            console.warn(`[Bonsai Capture] Could not find project conversation root for: ${projectUrl}`);
+            return [];
+        }
+
+        await this.scrollProjectConversationList(root, 45000);
+
+        // Collect all conversation links on this project page
+        const items: import('./interface').SidebarItem[] = [];
+        const seen = new Set<string>();
+        this.collectProjectConversationLinks(root).forEach(link => {
+            const href = link.getAttribute('href') || '';
+            const match = href.match(/\/c\/([a-z0-9-]+)/i);
+            if (!match) return;
+
+            const id = match[1];
+            if (seen.has(id)) return;
+            seen.add(id);
+
+            let title = link.innerText?.trim() || link.textContent?.trim() || 'Untitled';
+            title = title.split('\n')[0].trim();
+
+            if (id && title.toLowerCase() !== 'new chat' && title.length > 1) {
+                items.push({
+                    id,
+                    title,
+                    url: href.startsWith('http') ? href : `https://chatgpt.com/c/${id}`,
+                    projectName,
+                    projectUrl,
+                });
+            }
+        });
+
+        console.log(`[Bonsai Capture] Found ${items.length} conversations in project "${projectName}".`);
+        return items;
+    }
+
+    private async waitForProjectPageReady(projectUrl: string, timeoutMs: number): Promise<boolean> {
+        const deadline = Date.now() + timeoutMs;
+        const targetPath = this.normalizePath(projectUrl);
+        while (Date.now() < deadline) {
+            const onTargetPage = this.normalizePath(window.location.href) === targetPath;
+            const root = this.getProjectConversationRoot();
+            const links = this.collectProjectConversationLinks(root ?? document);
+            if (onTargetPage && links.length > 0) return true;
+            await this.delay(400);
+        }
+        return false;
+    }
+
+    private findSidebarLinkForId(id: string): HTMLElement | null {
+        const candidateSelectors = [
+            this.selectors.projectConversationItem,
+            `a[href*="/c/${id}"]`,
+            `a[href*="${id}"]`,
+        ].filter((selector): selector is string => Boolean(selector)).join(', ');
+
+        if (!candidateSelectors) return null;
+
+        const candidates = Array.from(document.querySelectorAll(candidateSelectors)) as HTMLElement[];
+        return (
+            candidates.find(link => {
+                const href = (link as HTMLAnchorElement).href || link.getAttribute('href') || '';
+                return href.includes(`/c/${id}`) && this.isVisibleElement(link);
+            }) ??
+            candidates.find(link => {
+                const href = (link as HTMLAnchorElement).href || link.getAttribute('href') || '';
+                return href.includes(`/c/${id}`);
+            }) ??
+            null
+        );
+    }
+
+    /**
+     * Progressively scroll the sidebar nav to reveal the target conversation link.
+     * Scrolls from the CURRENT scroll position (not from 0), so sequential calls for
+     * items processed top-to-bottom are efficient — each call adds only a small scroll delta.
+     * Does NOT reset scroll position after finding the link (we're navigating away anyway).
+     */
+    private async scrollSidebarToFindLink(id: string, timeoutMs = 9000): Promise<HTMLElement | null> {
+        const nav = document.querySelector('nav') as HTMLElement | null;
+        if (!nav) return null;
+
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            const link = this.findSidebarLinkForId(id);
+            if (link) return link;
+
+            // Reached the bottom — nothing more to load
+            if (nav.scrollTop + nav.clientHeight >= nav.scrollHeight - 5) break;
+
+            nav.scrollTop += 320;
+            await this.delay(350);
+        }
+
+        return null;
+    }
+
+    async loadConversation(id: string, projectUrl?: string): Promise<boolean> {
+        // If already on the page
+        if (window.location.href.includes(`/c/${id}`)) {
+            const fp = this.getConversationFingerprint();
+            if (fp && this.hasRenderedMessageContent()) return true;
+            return this.waitForConversationReady(id, '', 45000);
+        }
+
+        const baselineFingerprint = this.getConversationFingerprint();
+
+        if (projectUrl) {
+            const projectLoaded = await this.loadProjectPage(projectUrl, 45000);
+            if (projectLoaded) {
+                const projectLink = await this.scrollProjectConversationToFindLink(id, 30000);
+                if (projectLink) {
+                    projectLink.click();
+                    return this.waitForConversationReady(id, baselineFingerprint, 45000);
+                }
+            }
+        }
+
+        // 1. Check if the link is already in the DOM (visible or just off-screen)
+        let sidebarLink = this.findSidebarLinkForId(id);
+
+        // 2. Not in DOM — scroll the sidebar to lazy-load more history items
+        if (!sidebarLink) {
+            sidebarLink = await this.scrollSidebarToFindLink(id);
+        }
+
         if (sidebarLink) {
             sidebarLink.click();
-            // Wait for load? tough to know when done without complex logic
-            // Capture engine usually waits or retries
-            return true;
+            return this.waitForConversationReady(id, baselineFingerprint, 45000);
         }
 
-        // Fallback: Location change
+        // 3. Last resort: full URL navigation (causes page reload).
+        //    The side panel must call waitForTabReadyAtUrl() after this to
+        //    wait for the new content script to be ready before sending CAPTURE.
         window.location.href = `https://chatgpt.com/c/${id}`;
         return true;
     }
@@ -1703,8 +2245,11 @@ class ChatGPTAdapter extends BaseAdapter {
         const contentArea = el.querySelector('.markdown, .message-content, [data-message-content], [data-testid="message-content"], .chat-message-text, .text-base') ?? el;
 
         if (role === 'assistant') {
+            // Include ul/ol: bullet lists are rich formatting that the text-extraction path
+            // cannot represent faithfully (list structure is lost). Going through sanitizeRichHtml
+            // produces clean HTML that the markdown exporter can convert to proper bullet syntax.
             const hasStructuredCode = Boolean(
-                contentArea.querySelector('pre, code, [data-testid*="code"], .code-block, table')
+                contentArea.querySelector('pre, code, [data-testid*="code"], .code-block, table, ul, ol')
             );
 
             if (hasStructuredCode) {
@@ -1772,9 +2317,6 @@ class ChatGPTAdapter extends BaseAdapter {
 
         // Sanitize chat-specific prefixes and quote markers (carats)
         textContent = this.sanitizeMessageText(textContent);
-
-        // 5. Escape Asterisks (Subjective preference from Claude task, applying here for consistency)
-        textContent = textContent.replace(/\*/g, '\u2217');
 
         // 6. Split and Reassemble
         const parts = textContent.split(/<<<BONSAI_CODE_BLOCK_(\d+)>>>/);
@@ -1897,6 +2439,9 @@ class ChatGPTAdapter extends BaseAdapter {
 
         // Skip hidden or invisible
         if (tagName === 'style' || tagName === 'script' || tagName === 'noscript') return '';
+        if (tagName === 'button' || tagName === 'svg' || el.classList.contains('bonsai-insert-btn') || el.getAttribute('role') === 'button') {
+            return '';
+        }
 
         let text = '';
 
@@ -1921,7 +2466,15 @@ class ChatGPTAdapter extends BaseAdapter {
         this.extractedFrameContentPromise = null;
         this.openAIProbeSnapshotsPromise = null;
 
-        const title = document.title;
+        // Remove stale data-bonsai-index attributes left by previous capture attempts
+        // so extractCodeBlocks doesn't skip already-tagged elements.
+        document.querySelectorAll('[data-bonsai-index]').forEach(el => {
+            el.removeAttribute('data-bonsai-index');
+        });
+
+        const title = this.resolveCurrentConversationTitle(
+            window.location.pathname.includes('/project') ? 'Project Overview' : 'Untitled'
+        );
         const messageEls = this.listMessages();
         const messages: MessageNode[] = [];
         const allArtifacts: ArtifactNode[] = [];
@@ -1963,11 +2516,15 @@ class ChatGPTAdapter extends BaseAdapter {
             attachArtifacts(targetMessage, visibleArtifacts);
         }
 
+        const allDeepResearchArtifacts = allArtifacts.filter(a => a.type === 'deep_research');
+
         messages.forEach((message) => {
-            const referenceBlock = this.createArtifactReferenceBlock(artifactsByMessageId.get(message.message_id) ?? []);
+            const msgArtifacts = artifactsByMessageId.get(message.message_id) ?? [];
+            const referenceBlock = this.createArtifactReferenceBlock(msgArtifacts);
             if (referenceBlock) {
                 message.content_blocks.push(referenceBlock);
             }
+            this.linkDeepResearchLabels(message, msgArtifacts, allDeepResearchArtifacts);
         });
 
         return {
@@ -2150,7 +2707,14 @@ class ChatGPTAdapter extends BaseAdapter {
             artifacts.push(canvasArtifact);
         }
 
-        for (const embed of this.getDeepResearchEmbeds(document.body)) {
+        // Scope deep-research scan to the conversation thread, not document.body,
+        // so stale artifact panels from the previous conversation are not captured.
+        const threadRoot: Element =
+            document.querySelector('[data-testid="conversation-turn-list"], [data-testid="chat-history"], div[role="log"]')
+            ?? document.querySelector('main')
+            ?? document.body;
+
+        for (const embed of this.getDeepResearchEmbeds(threadRoot)) {
             const artifact = await this.createDeepResearchArtifact(embed);
             if (!artifact) continue;
 
@@ -2168,8 +2732,16 @@ class ChatGPTAdapter extends BaseAdapter {
         }
 
         const visibleArtifacts = Array.from(
-            document.querySelectorAll('[data-artifact-id], .artifact-reference, [data-testid*="artifact"], [data-testid*="research"], [class*="artifact"], [class*="research"], [class*="report"]')
-        ).filter((candidate): candidate is Element => candidate instanceof Element && this.isVisibleElement(candidate));
+            // Intentionally omit [class*="research"] and [class*="report"] — those broad class
+            // selectors match ChatGPT navigation items (e.g. the "Deep research" sidebar link
+            // and recents containers), producing phantom appendix entries with nav content.
+            document.querySelectorAll('[data-artifact-id], .artifact-reference, [data-testid*="artifact"], [data-testid*="research"], [class*="artifact"]')
+        ).filter((candidate): candidate is Element =>
+            candidate instanceof Element &&
+            this.isVisibleElement(candidate) &&
+            // Exclude anything inside the navigation sidebar
+            !candidate.closest('nav, [role="navigation"], [data-testid*="sidebar"], [data-testid*="nav"], [data-testid*="history"]')
+        );
 
         for (const ref of visibleArtifacts) {
             const descriptor = `${ref.className || ''} ${ref.getAttribute('data-testid') || ''} ${(ref.textContent || '').slice(0, 200)}`.toLowerCase();

@@ -8,6 +8,7 @@ import { BaseAdapter, ParsedConversation } from './interface';
 import {
     MessageNode,
     ArtifactNode,
+    ArtifactType,
     ContentBlock,
     DeepLink,
     Provenance,
@@ -273,7 +274,65 @@ export class GrokAdapter extends BaseAdapter {
     }
 
     parseArtifacts(el: Element): ArtifactNode[] {
-        return []; // TODO: Implement
+        const artifacts: ArtifactNode[] = [];
+        const messageId = el.getAttribute('data-message-id') || `grok-msg-${Date.now()}`;
+        let artifactIdx = 0;
+
+        // Extract code blocks as code_artifact
+        el.querySelectorAll('pre').forEach(pre => {
+            const codeEl = pre.querySelector('code');
+            const codeText = (codeEl ?? pre).textContent?.trim();
+            if (!codeText) return;
+
+            // Detect language from <code class="language-xxx">
+            const langFromClass = (codeEl?.className ?? '').match(/\blanguage-(\w+)\b/)?.[1] ?? '';
+            let lang = langFromClass;
+            if (!lang) {
+                let parent: Element | null = pre.parentElement;
+                while (parent && parent !== el) {
+                    const label = parent.querySelector('.language-label');
+                    if (label) { lang = (label.textContent?.trim() ?? '').toLowerCase(); break; }
+                    parent = parent.parentElement;
+                }
+            }
+
+            artifacts.push({
+                artifact_id: `${messageId}-code-${artifactIdx++}`,
+                type: 'code_artifact' as ArtifactType,
+                title: lang ? `Code (${lang})` : 'Code snippet',
+                mime_type: lang ? `text/${lang}` : 'text/plain',
+                content: { code: codeText, language: lang || undefined },
+                source_message_id: messageId,
+                source_url: window.location.href,
+                exportable: true,
+            });
+        });
+
+        // Extract generated images (Grok Imagine) as image artifacts
+        const seen = new Set<string>();
+        el.querySelectorAll('[class*="grok-image"] img').forEach(img => {
+            const className = typeof (img as HTMLElement).className === 'string'
+                ? (img as HTMLElement).className
+                : '';
+            if (className.includes('absolute')) return;
+
+            const src = (img as HTMLImageElement).src;
+            if (!src || seen.has(src)) return;
+            seen.add(src);
+
+            artifacts.push({
+                artifact_id: `${messageId}-img-${artifactIdx++}`,
+                type: 'image' as ArtifactType,
+                title: 'Generated image',
+                mime_type: 'image/png',
+                content: src,
+                source_message_id: messageId,
+                source_url: window.location.href,
+                exportable: true,
+            });
+        });
+
+        return artifacts;
     }
 
     getDeepLink(el: Element): DeepLink {

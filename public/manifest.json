@@ -19,8 +19,7 @@
       "http://localhost:3000/*",
       "http://127.0.0.1:3000/*",
       "http://localhost:8080/*",
-      "http://127.0.0.1:8080/*",
-      "https://*.bonsai.app/*"
+      "http://127.0.0.1:8080/*"
     ]
   },
   "host_permissions": [
@@ -34,7 +33,8 @@
     "https://*.googleusercontent.com/*",
     "https://*.ggpht.com/*",
     "https://*.google.com/*",
-    "https://*.usercontent.google.com/*"
+    "https://*.usercontent.google.com/*",
+    "https://jules.google.com/*"
   ],
   "background": {
     "service_worker": "background.js",
@@ -92,21 +92,6 @@
         "content/grok.js"
       ],
       "run_at": "document_idle"
-    },
-    {
-      "matches": [
-        "http://localhost/*",
-        "http://127.0.0.1/*",
-        "http://localhost:3000/*",
-        "http://127.0.0.1:3000/*",
-        "http://localhost:8080/*",
-        "http://127.0.0.1:8080/*",
-        "https://*.bonsai.app/*"
-      ],
-      "js": [
-        "content/bonsai_webui.js"
-      ],
-      "run_at": "document_start"
     }
   ],
   "action": {

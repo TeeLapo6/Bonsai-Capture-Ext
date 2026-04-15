@@ -11,8 +11,7 @@ const ADAPTERS = {
     'content/chatgpt': 'src/content/adapters/chatgpt.ts',
     'content/claude': 'src/content/adapters/claude.ts',
     'content/gemini': 'src/content/adapters/gemini.ts',
-    'content/grok': 'src/content/adapters/grok.ts',
-    'content/bonsai_webui': 'src/content/adapters/bonsai_webui.ts'
+    'content/grok': 'src/content/adapters/grok.ts'
 };
 
 async function buildAll() {

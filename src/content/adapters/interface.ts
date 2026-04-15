@@ -20,6 +20,17 @@ export interface SidebarItem {
     id: string;
     title: string;
     url: string;
+    /** Populated when the conversation belongs to a ChatGPT Project (or equivalent). */
+    projectName?: string;
+    /** Project page URL used to reopen and scroll project conversation lists during bulk capture. */
+    projectUrl?: string;
+}
+
+export interface ProjectInfo {
+    /** URL of the project page, e.g. https://chatgpt.com/g/g-p-{hash}-{slug}/project */
+    url: string;
+    /** Human-readable project name extracted from the sidebar */
+    name: string;
 }
 
 export interface ParsedConversation {
@@ -112,13 +123,26 @@ export interface ProviderAdapter {
 
     /**
      * Scan the sidebar for available conversations.
+     * Returns only regular (non-project) history conversations.
      */
     scanSidebar(): Promise<SidebarItem[]> | SidebarItem[];
 
     /**
+     * Discover all projects visible in the sidebar nav.
+     * Fast — only reads the DOM, no navigation.
+     */
+    discoverProjects(): Promise<ProjectInfo[]> | ProjectInfo[];
+
+    /**
+     * Navigate to the given project page, scroll to lazy-load all conversations,
+     * and return the full list tagged with the given projectName.
+     */
+    scanProjectConversations(projectUrl: string, projectName: string): Promise<SidebarItem[]>;
+
+    /**
      * Load a conversation by ID/URL.
      */
-    loadConversation(id: string): Promise<boolean>;
+    loadConversation(id: string, projectUrl?: string): Promise<boolean>;
 
     /**
      * Apply provider-specific capture settings from the sidepanel.
@@ -150,7 +174,15 @@ export abstract class BaseAdapter implements ProviderAdapter {
         return [];
     }
 
-    async loadConversation(id: string): Promise<boolean> {
+    async discoverProjects(): Promise<ProjectInfo[]> {
+        return [];
+    }
+
+    async scanProjectConversations(_projectUrl: string, _projectName: string): Promise<SidebarItem[]> {
+        return [];
+    }
+
+    async loadConversation(id: string, _projectUrl?: string): Promise<boolean> {
         return false;
     }
 
@@ -241,11 +273,13 @@ export abstract class BaseAdapter implements ProviderAdapter {
                 return typeof artifact.content === 'string' && artifact.content.trim().length > 0;
             }
 
-            if (artifact.type === 'deep_research' || artifact.type === 'file') {
-                return true;
+            if (artifact.type === 'deep_research') {
+                // Only include deep_research in the appendix if it has a linkable URL;
+                // phantom artifacts captured from stale/cross-conversation iframes lack URLs.
+                return Boolean(artifact.view_url || artifact.source_url);
             }
 
-            if (artifact.mime_type === 'text/html' && typeof artifact.content === 'string' && artifact.content.length > 1200) {
+            if (artifact.type === 'file') {
                 return true;
             }
 
@@ -262,12 +296,61 @@ export abstract class BaseAdapter implements ProviderAdapter {
             return null;
         }
 
+        const escapeHtml = (value: string): string => value
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+
         const lines = appendixArtifacts.map((artifact, index) => {
             const title = artifact.title?.trim() || `${artifact.type.replace(/_/g, ' ')} ${index + 1}`;
-            return `- [${title}](#artifact-${artifact.artifact_id})`;
+            return `- <a href="#artifact-${artifact.artifact_id}">${escapeHtml(title)}</a>`;
         });
 
         return createMarkdownBlock(`See appendix:\n\n${lines.join('\n')}`);
+    }
+
+    /**
+     * Replaces any content block in `message` that contains just a deep-research label
+     * (e.g. "**Deep research report**" or the artifact's actual title) with a markdown link
+     * pointing to the artifact.  `msgArtifacts` are the artifacts already scoped to this
+     * message; `allDeepResearchArtifacts` is the global fallback for multi-turn chats where
+     * the deep-research iframe ends up attached to a *different* message than the label.
+     */
+    protected linkDeepResearchLabels(
+        message: MessageNode,
+        msgArtifacts: ArtifactNode[],
+        allDeepResearchArtifacts: ArtifactNode[] = [],
+    ): void {
+        // Prefer message-scoped artifact, then any conversation-level deep_research artifact.
+        const candidates = [
+            ...msgArtifacts.filter(a => a.type === 'deep_research'),
+            ...allDeepResearchArtifacts,
+        ];
+        if (candidates.length === 0) return;
+        const artifact = candidates[0];
+
+        const GENERIC_LABEL = /^deep\s+research\s+report$/i;
+        const artifactTitleLower = (artifact.title ?? '').toLowerCase();
+        const escapeHtml = (value: string): string => value
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+
+        for (let i = 0; i < message.content_blocks.length; i++) {
+            const block = message.content_blocks[i];
+            if (block.type !== 'markdown' && block.type !== 'text') continue;
+            // Strip bold/italic markers so "**Deep research report**" matches too.
+            const rawText = block.value.trim().replace(/^\*+|\*+$/g, '').trim();
+            if (!GENERIC_LABEL.test(rawText) && rawText.toLowerCase() !== artifactTitleLower) continue;
+            message.content_blocks[i] = {
+                type: 'markdown',
+                value: `<a href="#artifact-${artifact.artifact_id}">${escapeHtml(rawText)}</a>`,
+            };
+        }
     }
 
     protected extractArtifactLinks(el: Element): { viewUrl?: string; sourceUrl?: string } {

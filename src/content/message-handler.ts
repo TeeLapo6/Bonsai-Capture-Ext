@@ -136,10 +136,38 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
                     }
                     break;
 
+                case 'DISCOVER_PROJECTS': {
+                    const dpAdapter = captureEngine.getAdapter();
+                    if (dpAdapter && dpAdapter.discoverProjects) {
+                        const projects = await dpAdapter.discoverProjects();
+                        sendResponse({ projects });
+                    } else {
+                        sendResponse({ projects: [] });
+                    }
+                    break;
+                }
+
+                case 'SCAN_PROJECT': {
+                    const spAdapter = captureEngine.getAdapter();
+                    if (spAdapter && spAdapter.scanProjectConversations) {
+                        const items = await spAdapter.scanProjectConversations(
+                            message.projectUrl as string,
+                            message.projectName as string
+                        );
+                        sendResponse({ items });
+                    } else {
+                        sendResponse({ items: [] });
+                    }
+                    break;
+                }
+
                 case 'LOAD_CONVERSATION':
                     const loadAdapter = captureEngine.getAdapter();
                     if (loadAdapter && loadAdapter.loadConversation) {
-                        const success = await loadAdapter.loadConversation(message.id);
+                        const success = await loadAdapter.loadConversation(
+                            message.id,
+                            typeof message.projectUrl === 'string' ? message.projectUrl : undefined
+                        );
                         sendResponse({ success });
                     } else {
                         sendResponse({ success: false });

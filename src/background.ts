@@ -755,6 +755,43 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true;
     }
 
+    if (message.type === 'REINJECT_CONTENT_SCRIPT') {
+        (async () => {
+            const tabId = message.tabId as number | undefined;
+            const url = message.url as string | undefined;
+            if (!tabId || !url) {
+                sendResponse({ success: false, error: 'Missing tabId or url' });
+                return;
+            }
+
+            // Determine which content script to inject based on URL
+            const scriptMap: Array<{ pattern: RegExp; files: string[] }> = [
+                { pattern: /chatgpt\.com|chat\.openai\.com/, files: ['content/chatgpt.js'] },
+                { pattern: /claude\.ai/, files: ['content/claude.js'] },
+                { pattern: /gemini\.google\.com/, files: ['content/gemini.js'] },
+                { pattern: /grok\.com/, files: ['content/grok.js'] },
+                { pattern: /jules\.google\.com/, files: ['content/jules.js'] },
+            ];
+
+            const match = scriptMap.find(s => s.pattern.test(url));
+            if (!match) {
+                sendResponse({ success: false, error: 'No content script for this URL' });
+                return;
+            }
+
+            try {
+                await chrome.scripting.executeScript({
+                    target: { tabId },
+                    files: match.files,
+                });
+                sendResponse({ success: true });
+            } catch (error) {
+                sendResponse({ success: false, error: String(error) });
+            }
+        })();
+        return true;
+    }
+
     return false;
 });
 
