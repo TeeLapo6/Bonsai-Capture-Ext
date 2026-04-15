@@ -976,13 +976,8 @@ export function SidePanel() {
         };
     }, []);
 
-    // Auto-discover projects when the user opens the Bulk tab
-    useEffect(() => {
-        if (activeTab === 'bulk' && availableProjects.length === 0 && !isDiscoveringProjects) {
-            discoverProjectsForScope();
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [activeTab]);
+    // No auto-discover on bulk tab open — user clicks ⟳ Projects explicitly
+    // to avoid unwanted page navigation.
 
     // Listen for inline button clicks (MESSAGE_SELECTED from background)
     useEffect(() => {
@@ -1101,17 +1096,64 @@ export function SidePanel() {
         URL.revokeObjectURL(url);
     }, [currentCapture]);
 
-    // Insert to editor
+    /** Navigate the active tab to `url` and wait until the content script is
+     *  responsive (page loaded + content script re-injected after hard nav).
+     *  Returns the tab ID on success, or null on timeout. */
+    const navigateTabAndWait = async (
+        tabId: number,
+        url: string,
+        timeoutMs = 30000,
+    ): Promise<number | null> => {
+        await chrome.tabs.update(tabId, { url });
+
+        const deadline = Date.now() + timeoutMs;
+        // Wait for tab to finish loading
+        await new Promise<void>((resolve) => {
+            const check = setInterval(async () => {
+                if (Date.now() > deadline) { clearInterval(check); resolve(); return; }
+                try {
+                    const t = await chrome.tabs.get(tabId);
+                    if (t.status === 'complete') { clearInterval(check); resolve(); }
+                } catch { clearInterval(check); resolve(); }
+            }, 400);
+        });
+        // Give the content script a moment to initialise after page load
+        await new Promise(r => setTimeout(r, 1200));
+        // Verify the content script is alive by pinging it
+        const pingDeadline = Date.now() + Math.max(timeoutMs - (Date.now() - (deadline - timeoutMs)), 5000);
+        while (Date.now() < pingDeadline) {
+            try {
+                const pong = await chrome.tabs.sendMessage(tabId, { type: 'PING' }).catch(() => null);
+                if (pong) return tabId;
+            } catch { /* not ready yet */ }
+            await new Promise(r => setTimeout(r, 500));
+        }
+        return null;
+    };
+
+    /** Detect whether the active tab is on Claude */
+    const isClaudeTab = (tab: chrome.tabs.Tab): boolean => {
+        return !!tab.url?.includes('claude.ai');
+    };
+
     const discoverProjectsForScope = async () => {
         setIsDiscoveringProjects(true);
         try {
             const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
             if (!tab?.id) return;
+
+            // For Claude: navigate to /projects page first so the content script
+            // can scrape project links from the DOM without navigating itself.
+            if (isClaudeTab(tab) && !tab.url?.includes('/projects')) {
+                const origin = new URL(tab.url!).origin;
+                const readyId = await navigateTabAndWait(tab.id, `${origin}/projects`);
+                if (!readyId) { console.error('Timed out navigating to /projects'); return; }
+            }
+
             const response = await chrome.tabs.sendMessage(tab.id, { type: 'DISCOVER_PROJECTS' }).catch(() => null);
             if (response?.projects) {
                 const projects = response.projects as ProjectInfo[];
                 setAvailableProjects(projects);
-                // Auto-select all discovered projects that aren't already scoped
                 setScopeProjectUrls(prev => {
                     const next = new Set(prev);
                     projects.forEach(p => next.add(p.url));
@@ -1149,18 +1191,30 @@ export function SidePanel() {
                 });
             };
 
-            // 1. Sidebar scan
+            // 1. Sidebar / Chat History scan
             if (scopeIncludeSidebar) {
+                // For Claude: navigate to /recents to get full conversation list
+                // (sidebar on /new or other pages only shows recent items)
+                if (isClaudeTab(tab) && !tab.url?.includes('/recents')) {
+                    const origin = new URL(tab.url!).origin;
+                    await navigateTabAndWait(tab.id, `${origin}/recents`);
+                }
+
                 const response = await chrome.tabs.sendMessage(tab.id, { type: 'SCAN_SIDEBAR' }).catch(() => null);
                 if (response?.items) addItems(response.items);
             }
 
-            // 2. Project scans — done sequentially so the content script has time to navigate
+            // 2. Project scans — navigate the tab to each project, then scrape
             for (const project of availableProjects) {
                 if (!scopeProjectUrls.has(project.url)) continue;
 
-                // SCAN_PROJECT causes the page to navigate; wait for the new content script
-                // The SCAN_PROJECT handler returns only after it has finished scrolling.
+                // Navigate the tab to the project page from the side panel
+                const readyId = await navigateTabAndWait(tab.id, project.url, 45000);
+                if (!readyId) {
+                    console.warn(`[Bonsai] Timed out navigating to project: ${project.name}`);
+                    continue;
+                }
+
                 const response = await chrome.tabs.sendMessage(tab.id, {
                     type: 'SCAN_PROJECT',
                     projectUrl: project.url,
@@ -1170,11 +1224,6 @@ export function SidePanel() {
                 if (response?.items) {
                     addItems(response.items, project.name);
                 }
-
-                // After navigation, re-query the tab to get updated tabId if needed
-                // (tab ID stays stable across SPA navigations; refresh the handle)
-                const [refreshedTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-                if (refreshedTab?.id) Object.assign(tab, refreshedTab);
             }
         } catch (e) {
             console.error('Scan failed', e);
@@ -1385,8 +1434,6 @@ export function SidePanel() {
             artifactMode: mode
         }));
     };
-
-    const isClaudeProvider = diagnostics?.site === 'claude.ai' || diagnostics?.provider === 'Anthropic';
 
     const handleInsertToEditor = useCallback((item: CapturedItem) => {
         if (!editor) return;
@@ -1740,40 +1787,6 @@ export function SidePanel() {
                             Applies to inline insert, Capture All, and Bulk captures.
                         </div>
 
-                        {isClaudeProvider && (
-                            <div className="capture-metadata-panel">
-                                <div className="capture-metadata-title">Claude Artifact Capture</div>
-                                <label className="capture-provider-setting">
-                                    <span className="capture-provider-setting-label">XPath</span>
-                                    <input
-                                        className="input"
-                                        type="text"
-                                        value={providerCaptureSettings.claude.xPath}
-                                        onChange={(event) => handleClaudeCaptureSettingsChange({ xPath: event.target.value })}
-                                        spellCheck={false}
-                                    />
-                                </label>
-                                <label className="capture-provider-setting">
-                                    <span className="capture-provider-setting-label">Delay Before Panel Capture (ms)</span>
-                                    <input
-                                        className="input"
-                                        type="number"
-                                        min={0}
-                                        step={50}
-                                        value={providerCaptureSettings.claude.panelCaptureDelayMs}
-                                        onChange={(event) => handleClaudeCaptureSettingsChange({
-                                            panelCaptureDelayMs: Number.isFinite(event.target.valueAsNumber)
-                                                ? event.target.valueAsNumber
-                                                : DEFAULT_PROVIDER_CAPTURE_SETTINGS.claude.panelCaptureDelayMs,
-                                        })}
-                                    />
-                                </label>
-                                <div className="capture-metadata-hint">
-                                    Claude document artifacts use this XPath first, then fall back to the visible panel DOM. These settings apply to inline insert, Capture All, and bulk capture.
-                                </div>
-                            </div>
-                        )}
-
                         {/* Actions */}
                         <div className="capture-actions">
                             <button className="btn btn-primary btn-full" onClick={handlePaste}>
@@ -2061,6 +2074,241 @@ export function SidePanel() {
                                   </div>
                             </div>
                         )}
+
+                        <div style={{ marginTop: '12px', paddingTop: '10px', borderTop: '1px solid var(--border-color)', fontSize: '11px', color: 'var(--text-secondary)', lineHeight: '1.5' }}>
+                            <strong>Provider export:</strong>{' '}
+                            <a href="https://help.openai.com/en/articles/7260999-how-do-i-export-my-chatgpt-history-and-data" target="_blank" rel="noreferrer" style={{ color: 'var(--accent-primary)' }}>ChatGPT</a>,{' '}
+                            <a href="https://support.anthropic.com/en/articles/8945820-how-can-i-export-my-claude-ai-data" target="_blank" rel="noreferrer" style={{ color: 'var(--accent-primary)' }}>Claude</a>,{' '}
+                            <a href="https://support.google.com/gemini/answer/13743730" target="_blank" rel="noreferrer" style={{ color: 'var(--accent-primary)' }}>Gemini</a>
+                        </div>
+                    </div>
+                )}
+
+                {activeTab === 'bulk' && (
+                    <div className="bulk-panel" style={{ padding: '16px' }}>
+                        <div className="bulk-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                            <h3 style={{ margin: 0 }}>Bulk Capture</h3>
+                            <div style={{ display: 'flex', gap: '6px' }}>
+                                <button
+                                    className="btn btn-secondary"
+                                    onClick={discoverProjectsForScope}
+                                    disabled={isBulkCapturing || isBulkScanning}
+                                    style={{ padding: '4px 8px', fontSize: '12px' }}
+                                    title="Re-discover projects from sidebar"
+                                >
+                                    {isDiscoveringProjects ? '⟳' : '⟳ Projects'}
+                                </button>
+                                <button
+                                    className="btn btn-secondary"
+                                    onClick={handleScan}
+                                    disabled={isBulkCapturing || isBulkScanning || (!scopeIncludeSidebar && scopeProjectUrls.size === 0)}
+                                    style={{ padding: '4px 8px', fontSize: '12px' }}
+                                >
+                                    {isBulkScanning ? 'Scanning...' : 'Scan'}
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* Scan scope checkboxes */}
+                        <div style={{ marginBottom: '12px', padding: '10px', background: 'var(--bg-secondary)', borderRadius: '6px', border: '1px solid var(--border-color)' }}>
+                            <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                                Scan Scope
+                            </div>
+                            {/* Sidebar */}
+                            <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', cursor: 'pointer', marginBottom: '4px', color: 'var(--text-primary)' }}>
+                                <input
+                                    type="checkbox"
+                                    checked={scopeIncludeSidebar}
+                                    onChange={e => setScopeIncludeSidebar(e.target.checked)}
+                                    disabled={isBulkCapturing || isBulkScanning}
+                                />
+                                💬 Chat History
+                            </label>
+                            {/* One checkbox per discovered project */}
+                            {availableProjects.length === 0 && !isDiscoveringProjects && (
+                                <div style={{ fontSize: '12px', color: 'var(--text-secondary)', paddingLeft: '4px' }}>
+                                    No projects found in sidebar. Open ChatGPT with projects visible, then click ⟳ Projects.
+                                </div>
+                            )}
+                            {isDiscoveringProjects && (
+                                <div style={{ fontSize: '12px', color: 'var(--text-secondary)', paddingLeft: '4px' }}>Discovering projects…</div>
+                            )}
+                            {availableProjects.map(p => (
+                                <label key={p.url} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', cursor: 'pointer', marginBottom: '4px', color: 'var(--text-primary)' }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={scopeProjectUrls.has(p.url)}
+                                        onChange={e => {
+                                            setScopeProjectUrls(prev => {
+                                                const next = new Set(prev);
+                                                if (e.target.checked) next.add(p.url);
+                                                else next.delete(p.url);
+                                                return next;
+                                            });
+                                        }}
+                                        disabled={isBulkCapturing || isBulkScanning}
+                                    />
+                                    📁 {p.name}
+                                </label>
+                            ))}
+                        </div>
+
+                        <div className="bulk-config" style={{ marginBottom: '12px' }}>
+                        </div>
+
+                        {/* ---- Sectioned bulk list ---- */}
+                        {(() => {
+                            // Partition into project sections + one "Chat History" section
+                            const projectNames = Array.from(
+                                new Set(
+                                    bulkItems
+                                        .map(i => i.projectName)
+                                        .filter((n): n is string => Boolean(n))
+                                )
+                            ).sort((a, b) => a.localeCompare(b));
+
+                            const historyItems = bulkItems.filter(i => !i.projectName);
+
+                            const renderSelectAll = (sectionItems: BulkItem[], sectionKey: string, label: string) => {
+                                const allSelected = sectionItems.length > 0 && sectionItems.every(i => i.selected);
+                                const someSelected = sectionItems.some(i => i.selected);
+                                const selectedCount = sectionItems.filter(i => i.selected).length;
+                                return (
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                        <input
+                                            type="checkbox"
+                                            id={`select-all-${sectionKey}`}
+                                            checked={allSelected}
+                                            ref={(el) => {
+                                                if (el) el.indeterminate = !allSelected && someSelected;
+                                            }}
+                                            onChange={(e) => {
+                                                const checked = e.target.checked;
+                                                setBulkItems(items =>
+                                                    items.map(i =>
+                                                        sectionItems.some(s => s.id === i.id)
+                                                            ? { ...i, selected: checked }
+                                                            : i
+                                                    )
+                                                );
+                                            }}
+                                            disabled={isBulkCapturing}
+                                        />
+                                        <label
+                                            htmlFor={`select-all-${sectionKey}`}
+                                            style={{ cursor: 'pointer', fontSize: '12px', fontWeight: 600, userSelect: 'none', color: 'var(--text-secondary)' }}
+                                        >
+                                            {label} ({selectedCount}/{sectionItems.length})
+                                        </label>
+                                    </div>
+                                );
+                            };
+
+                            const renderItem = (item: BulkItem) => (
+                                <div key={item.id} className={`bulk-item ${item.status}`} style={{
+                                    padding: '6px 8px',
+                                    borderBottom: '1px solid var(--border-color)',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '8px',
+                                    background: 'var(--bg-primary)',
+                                    color: 'var(--text-primary)'
+                                }}>
+                                    <input
+                                        type="checkbox"
+                                        checked={item.selected}
+                                        onChange={() =>
+                                            setBulkItems(items =>
+                                                items.map(i => i.id === item.id ? { ...i, selected: !i.selected } : i)
+                                            )
+                                        }
+                                        disabled={isBulkCapturing}
+                                    />
+                                    <span
+                                        className="bulk-item-title"
+                                        title={item.title}
+                                        style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', fontSize: '13px' }}
+                                    >
+                                        {item.title}
+                                    </span>
+                                    <span
+                                        className="bulk-item-status"
+                                        title={item.status === 'error'
+                                            ? (item.failureReason ?? 'Capture failed')
+                                            : item.status === 'capturing'
+                                                ? 'Capture in progress'
+                                                : item.status === 'success'
+                                                    ? 'Capture completed'
+                                                    : 'Pending capture'
+                                        }
+                                        style={{ fontSize: '12px', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                                    >
+                                        {item.status === 'success' && '✅'}
+                                        {item.status === 'error' && (
+                                            <span title={item.failureReason ?? 'Capture failed'} style={{ cursor: 'help' }}>❌</span>
+                                        )}
+                                        {item.status === 'error' && item.failureReason && (
+                                            <span title={item.failureReason} style={{ cursor: 'help', opacity: 0.75 }}>ℹ️</span>
+                                        )}
+                                        {item.status === 'capturing' && '⏳'}
+                                    </span>
+                                </div>
+                            );
+
+                            const sectionHeaderStyle: React.CSSProperties = {
+                                padding: '6px 8px 4px',
+                                background: 'var(--bg-secondary)',
+                                borderBottom: '1px solid var(--border-color)',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '8px',
+                                position: 'sticky',
+                                top: 0,
+                                zIndex: 1,
+                            };
+
+                            return (
+                                <div className="bulk-list" style={{
+                                    border: '1px solid var(--border-color)',
+                                    borderRadius: '4px',
+                                    height: '320px',
+                                    overflowY: 'auto',
+                                    marginBottom: '16px',
+                                    backgroundColor: 'var(--bg-secondary)'
+                                }}>
+                                    {bulkItems.length === 0 ? (
+                                        <div className="empty-state" style={{ padding: '20px', textAlign: 'center', color: 'var(--text-secondary)' }}>
+                                            No conversations found. <br />Click Scan to list sidebar items.
+                                        </div>
+                                    ) : (
+                                        <>
+                                            {/* Project sections */}
+                                            {projectNames.map(projectName => {
+                                                const projectItems = bulkItems.filter(i => i.projectName === projectName);
+                                                return (
+                                                    <div key={`project-${projectName}`}>
+                                                        <div style={sectionHeaderStyle}>
+                                                            {renderSelectAll(projectItems, `project-${projectName}`, `📁 ${projectName}`)}
+                                                        </div>
+                                                        {projectItems.map(renderItem)}
+                                                    </div>
+                                                );
+                                            })}
+
+                                            {/* Chat History section */}
+                                            {historyItems.length > 0 && (
+                                                <div>
+                                                    <div style={sectionHeaderStyle}>
+                                                        {renderSelectAll(historyItems, 'history', '💬 Chat History')}
+                                                    </div>
+                                                    {historyItems.map(renderItem)}
+                                                </div>
+                                            )}
+                                        </>
+                                    )}
+                                </div>
+                            );
+                        })()}
 
                         <div className="bulk-actions">
                             <button
