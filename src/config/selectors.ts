@@ -96,19 +96,6 @@ export const PROVIDER_SELECTORS: Record<string, ProviderSelectors> = {
     codeLanguage: '.language-label',
     inputField: 'textarea, [contenteditable="true"]',
     submitButton: 'button[type="submit"], [data-testid="send-button"]'
-  },
-  'jules.google.com': {
-    // Jules is TASK-BASED, not chat-based
-    conversationContainer: 'main, [role="main"]',
-    messageBlock: '.task-container, [data-user], [data-task]',
-    roleClassUser: 'user-task, [data-user]',
-    roleClassAssistant: 'jules-task, .task-icon, [data-task]',
-    codeBlock: 'pre code, code-block, .code-block',
-    codeLanguage: '.language-label, [data-language]',
-    artifactPanel: '.artifact-panel, [data-testid="artifact"]',
-    modelIndicator: '.model-selector, [data-testid="model-info"]',
-    inputField: '.ProseMirror, textarea, [contenteditable="true"], .text-input',
-    submitButton: 'button[type="submit"], [data-testid="send-button"]'
   }
 };
 

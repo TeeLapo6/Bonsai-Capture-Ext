@@ -248,20 +248,7 @@ export class ProviderRegistry {
             }
         });
 
-        this.register({
-            name: 'google',
-            displayName: 'Jules',
-            domain: 'jules.google.com',
-            selectors: {
-                container: '.tasks-container, main',
-                message: '.task-container, .task-description',
-                input: '.ProseMirror'
-            },
-            roleDetection: {
-                userClasses: ['user-task'],
-                assistantClasses: ['jules-task']
-            }
-        });
+
     }
 
     static getAdapter(hostname: string): ProviderAdapter | null {
