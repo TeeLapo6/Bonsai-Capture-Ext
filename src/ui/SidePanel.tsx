@@ -2058,12 +2058,9 @@ export function SidePanel() {
                                     >
                                         📦 ZIP (HTML)
                                     </button>
-                                </div>
-                                    </div>
-
-                                </div>
-                            );
-                        })()}
+                                  </div>
+                            </div>
+                        )}
 
                         <div className="bulk-actions">
                             <button
@@ -2113,6 +2110,6 @@ export function SidePanel() {
                     </div>
                 )}
             </div>
-        </div >
+        </div>
     );
 }

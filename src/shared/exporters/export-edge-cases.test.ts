@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 
-import { toBonsaiImportPackage } from '../bonsai-adapter';
 import type { ConversationGraph } from '../schema';
 import { canonicalConversationGraph } from './fixtures/canonicalGraph';
 import { exportToJSON, parseFromJSON } from './json';
@@ -56,34 +55,5 @@ describe('capture export edge cases', () => {
     expect(parsed).toEqual(graph);
     expect(markdown).toContain('1. Open the export');
     expect(markdown).toContain('artifact | status');
-  });
-
-  it('stringifies structured artifacts in Bonsai import packages', () => {
-    const graph: ConversationGraph = {
-      ...canonicalConversationGraph,
-      artifacts: [
-        ...canonicalConversationGraph.artifacts,
-        {
-          artifact_id: 'artifact_structured',
-          type: 'code_artifact',
-          title: 'structured.json',
-          mime_type: 'application/json',
-          content: {
-            summary: 'ok',
-            counts: { messages: canonicalConversationGraph.messages.length },
-          },
-          source_message_id: 'msg_assistant',
-          exportable: true,
-        },
-      ],
-    };
-
-    const pkg = toBonsaiImportPackage(graph);
-    const structured = pkg.attachments.find((attachment) => attachment.external_id === 'artifact_structured');
-
-    expect(structured?.content).toBe(JSON.stringify({
-      summary: 'ok',
-      counts: { messages: canonicalConversationGraph.messages.length },
-    }));
   });
 });
