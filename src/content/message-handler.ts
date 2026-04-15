@@ -29,6 +29,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     (async () => {
         try {
             switch (message.type) {
+                case 'PING':
+                    sendResponse({ pong: true });
+                    break;
+
                 case 'GET_DIAGNOSTICS':
                     sendResponse(captureEngine.getDiagnostics());
                     break;
