@@ -73,10 +73,7 @@ src/
 ├── shared/
 │   ├── schema.ts              # ConversationGraph canonical types
 │   └── exporters/
-<<<<<<< HEAD
 │       ├── html.ts
-=======
->>>>>>> 5fb22e1 (docs: update README for v0.1.0 alpha launch — adds Jules, capability matrix, removes Bonsai import refs)
 │       ├── markdown.ts
 │       ├── json.ts
 │       └── toon.ts

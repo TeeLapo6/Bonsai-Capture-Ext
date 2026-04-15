@@ -985,8 +985,13 @@ export function SidePanel() {
         };
     }, []);
 
-    // No auto-discover on bulk tab open — user clicks ⟳ Projects explicitly
-    // to avoid unwanted page navigation.
+    // Auto-discover projects when the user opens the Bulk tab
+    useEffect(() => {
+        if (activeTab === 'bulk' && availableProjects.length === 0 && !isDiscoveringProjects) {
+            discoverProjectsForScope();
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [activeTab]);
 
     // Listen for inline button clicks (MESSAGE_SELECTED from background)
     useEffect(() => {
@@ -1268,6 +1273,7 @@ export function SidePanel() {
             if (response?.projects) {
                 const projects = response.projects as ProjectInfo[];
                 setAvailableProjects(projects);
+                // Auto-select all discovered projects that aren't already scoped
                 setScopeProjectUrls(prev => {
                     const next = new Set(prev);
                     projects.forEach(p => next.add(p.url));
@@ -1305,30 +1311,18 @@ export function SidePanel() {
                 });
             };
 
-            // 1. Sidebar / Chat History scan
+            // 1. Sidebar scan
             if (scopeIncludeSidebar) {
-                // For Claude: navigate to /recents to get full conversation list
-                // (sidebar on /new or other pages only shows recent items)
-                if (isClaudeTab(tab) && !tab.url?.includes('/recents')) {
-                    const origin = new URL(tab.url!).origin;
-                    await navigateTabAndWait(tab.id, `${origin}/recents`);
-                }
-
                 const response = await chrome.tabs.sendMessage(tab.id, { type: 'SCAN_SIDEBAR' }).catch(() => null);
                 if (response?.items) addItems(response.items);
             }
 
-            // 2. Project scans — navigate the tab to each project, then scrape
+            // 2. Project scans — done sequentially so the content script has time to navigate
             for (const project of availableProjects) {
                 if (!scopeProjectUrls.has(project.url)) continue;
 
-                // Navigate the tab to the project page from the side panel
-                const readyId = await navigateTabAndWait(tab.id, project.url, 45000);
-                if (!readyId) {
-                    console.warn(`[Bonsai] Timed out navigating to project: ${project.name}`);
-                    continue;
-                }
-
+                // SCAN_PROJECT causes the page to navigate; wait for the new content script
+                // The SCAN_PROJECT handler returns only after it has finished scrolling.
                 const response = await chrome.tabs.sendMessage(tab.id, {
                     type: 'SCAN_PROJECT',
                     projectUrl: project.url,
@@ -1338,6 +1332,11 @@ export function SidePanel() {
                 if (response?.items) {
                     addItems(response.items, project.name);
                 }
+
+                // After navigation, re-query the tab to get updated tabId if needed
+                // (tab ID stays stable across SPA navigations; refresh the handle)
+                const [refreshedTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+                if (refreshedTab?.id) Object.assign(tab, refreshedTab);
             }
         } catch (e) {
             console.error('Scan failed', e);
@@ -1548,6 +1547,8 @@ export function SidePanel() {
             artifactMode: mode
         }));
     };
+
+    const isClaudeProvider = diagnostics?.site === 'claude.ai' || diagnostics?.provider === 'Anthropic';
 
     const handleInsertToEditor = useCallback((item: CapturedItem) => {
         if (!editor) return;
@@ -1906,6 +1907,9 @@ export function SidePanel() {
                                     </div>
                                 )}
                             </div>
+                        </div>
+                        <div className="capture-metadata-hint">
+                            Applies to inline insert, Capture All, and Bulk captures.
                         </div>
                         <div className="capture-metadata-hint">
                             Applies to inline insert, Capture All, and Bulk captures.
