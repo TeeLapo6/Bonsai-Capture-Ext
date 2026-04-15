@@ -10,11 +10,10 @@ A Chrome extension (Manifest V3) that captures AI chat conversations — includi
 | Claude | ✅ | ✅ | ✅ | — | ✅ (Canvas) |
 | Gemini | ✅ | ✅ | ✅ | ✅ | ✅ (Immersive) |
 | Grok | ✅ | — | — | — | — |
-| Jules | ✅ | — | ✅ | — | — |
 
 ## Features
 
-- **Multi-provider capture** — one extension flow for ChatGPT, Claude, Gemini, Grok, and Jules
+- **Multi-provider capture** — one extension flow for ChatGPT, Claude, Gemini, and Grok
 - **Artifact capture** — code artifacts, HTML previews, Claude Canvas, ChatGPT Deep Research, Gemini immersive artifacts, and generated images/video captured alongside the conversation
 - **Capture scopes** — entire conversation, up to a message, this message only, or this message + following
 - **Structured exports** — Markdown, HTML, JSON, TOON; YAML frontmatter, code fences, and artifact references preserved
@@ -65,9 +64,7 @@ src/
 │   │   ├── chatgpt.ts
 │   │   ├── claude.ts
 │   │   ├── gemini.ts
-│   │   ├── grok.ts
-│   │   ├── jules.ts
-│   │   └── bonsai_webui.ts
+│   │   └── grok.ts
 │   ├── capture-engine.ts      # Capture orchestration
 │   └── dom-injector.ts        # In-page insert/capture buttons
 ├── shared/

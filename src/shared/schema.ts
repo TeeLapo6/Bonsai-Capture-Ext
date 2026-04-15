@@ -13,7 +13,6 @@ export type ProviderSite =
     | 'chatgpt.com'
     | 'claude.ai'
     | 'gemini.google.com'
-    | 'jules.google.com'
     | 'grok.com'
     | 'unknown';
 

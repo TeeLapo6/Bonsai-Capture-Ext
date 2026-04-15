@@ -770,7 +770,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 { pattern: /claude\.ai/, files: ['content/claude.js'] },
                 { pattern: /gemini\.google\.com/, files: ['content/gemini.js'] },
                 { pattern: /grok\.com/, files: ['content/grok.js'] },
-                { pattern: /jules\.google\.com/, files: ['content/jules.js'] },
             ];
 
             const match = scriptMap.find(s => s.pattern.test(url));
