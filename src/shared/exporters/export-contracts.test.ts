@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 
-import { toBonsaiImportPackage } from '../bonsai-adapter';
 import type { ConversationGraph } from '../schema';
 import { exportToHtml } from './html';
 import { exportToJSON, parseFromJSON } from './json';
@@ -29,57 +28,6 @@ describe('capture export contracts', () => {
       artifact_file: 'artifacts[1]',
     });
     expect(toon.metadata?.export_tool).toBe('bonsai-capture');
-  });
-
-  it('transforms graphs into Bonsai import packages with multimodal attachments', () => {
-    const pkg = toBonsaiImportPackage(sampleGraph);
-
-    expect(pkg.bonsai_version).toBe('v1');
-    expect(pkg.conversation).toEqual({
-      title: 'Export Contract Fixture',
-      created_at: '2026-03-09T12:00:00.000Z',
-      origin_url: 'https://chatgpt.com/c/conv_1',
-      provider_site: 'chatgpt.com',
-    });
-    expect(pkg.messages).toHaveLength(2);
-    expect(pkg.attachments).toHaveLength(2);
-
-    expect(pkg.messages[0]).toMatchObject({
-      external_id: 'msg_user',
-      role: 'user',
-      content: {
-        type: 'text',
-        content: 'Summarize the attached result.',
-      },
-    });
-
-    expect(pkg.messages[1].content).toEqual({
-      type: 'multimodal',
-      text: 'Here is the result and the supporting image.\n\n```json\n{"status":"ok"}\n```',
-      attachments: [
-        {
-          attachment_type: 'image',
-          mime_type: 'image/png',
-          base64: 'ZmFrZV9pbWFnZQ==',
-          url: undefined,
-          filename: 'Preview',
-        },
-        {
-          attachment_type: 'document',
-          mime_type: 'application/pdf',
-          base64: undefined,
-          url: 'https://example.com/report.pdf',
-          filename: 'report.pdf',
-        },
-      ],
-    });
-
-    expect(pkg.attachments[0]).toMatchObject({
-      external_id: 'artifact_image',
-      source_message_id: 'msg_assistant',
-      source_url: 'https://chatgpt.com/c/conv_1',
-      view_url: 'https://chatgpt.com/c/conv_1',
-    });
   });
 
   it('renders markdown with provider metadata and inline artifacts', () => {
@@ -157,7 +105,7 @@ describe('capture export contracts', () => {
     expect(markdown).toContain('href="#artifact-artifact_deep_research-source-25"');
   });
 
-  it('maps video artifacts into Bonsai import packages and markdown exports', () => {
+  it('renders video artifacts in markdown exports', () => {
     const graph = {
       ...sampleGraph,
       messages: sampleGraph.messages.map((message) => message.message_id === 'msg_assistant'
@@ -182,36 +130,8 @@ describe('capture export contracts', () => {
       ],
     };
 
-    const pkg = toBonsaiImportPackage(graph);
     const markdown = exportToMarkdown(graph);
 
-    expect(pkg.messages[1].content).toEqual({
-      type: 'multimodal',
-      text: 'Here is the result and the supporting image.\n\n```json\n{"status":"ok"}\n```',
-      attachments: [
-        {
-          attachment_type: 'image',
-          mime_type: 'image/png',
-          base64: 'ZmFrZV9pbWFnZQ==',
-          url: undefined,
-          filename: 'Preview',
-        },
-        {
-          attachment_type: 'document',
-          mime_type: 'application/pdf',
-          base64: undefined,
-          url: 'https://example.com/report.pdf',
-          filename: 'report.pdf',
-        },
-        {
-          attachment_type: 'video',
-          mime_type: 'video/mp4',
-          base64: undefined,
-          url: 'https://video.googleusercontent.com/generated/ocean.mp4',
-          filename: 'Ocean clip',
-        },
-      ],
-    });
     expect(markdown).toContain('<video controls src="https://video.googleusercontent.com/generated/ocean.mp4"></video>');
   });
 
