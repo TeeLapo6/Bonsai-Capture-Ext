@@ -117,4 +117,54 @@ describe('ChatGPTAdapter bulk conversation loading', () => {
         expect(window.location.pathname).toBe('/c/target-conversation');
         expect(document.body.textContent).toContain('New assistant response');
     });
+
+    it('captures grouped turn wrappers and a trailing assistant bubble so Capture All ends on assistant', async () => {
+        const adapter = (window as any).__bonsaiAdapter as {
+            listMessages(): Element[];
+            captureConversation(): Promise<{ messages: Array<{ role: string; message_id?: string }> }>;
+        };
+
+        document.title = 'Launch Review - ChatGPT';
+        document.body.innerHTML = `
+            <main>
+                <div data-testid="conversation-turn-list">
+                    <section data-testid="conversation-turn-1">
+                        <article data-message-author-role="user" data-message-id="user-1">
+                            <div data-testid="message-content">Outline a launch review</div>
+                        </article>
+                        <article data-message-author-role="assistant" data-message-id="assistant-1">
+                            <div class="markdown">Here is the first draft.</div>
+                        </article>
+                    </section>
+                    <section data-testid="conversation-turn-2">
+                        <article data-message-author-role="user" data-message-id="user-2">
+                            <div data-testid="message-content">Proceed with both</div>
+                        </article>
+                    </section>
+                    <article data-message-author-role="assistant" data-message-id="assistant-2">
+                        <div class="markdown">
+                            <p>Homepage layout</p>
+                            <p>System diagram</p>
+                        </div>
+                    </article>
+                </div>
+            </main>
+        `;
+
+        expect(adapter.listMessages().map((el) => el.getAttribute('data-message-id'))).toEqual([
+            'user-1',
+            'assistant-1',
+            'user-2',
+            'assistant-2',
+        ]);
+
+        const graph = await adapter.captureConversation();
+
+        expect(graph.messages.map((message) => ({ id: message.message_id, role: message.role }))).toEqual([
+            { id: 'user-1', role: 'user' },
+            { id: 'assistant-1', role: 'assistant' },
+            { id: 'user-2', role: 'user' },
+            { id: 'assistant-2', role: 'assistant' },
+        ]);
+    });
 });
