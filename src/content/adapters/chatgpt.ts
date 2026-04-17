@@ -247,8 +247,41 @@ class ChatGPTAdapter extends BaseAdapter {
         return text.split(/\s+/).length >= 4;
     }
 
+    private isEditArtifactBubble(el: Element): boolean {
+        const text = el.textContent?.trim() || '';
+        return text.startsWith('You said:');
+    }
+
+    private expandMessageElements(elements: Element[]): Element[] {
+        const expanded: Element[] = [];
+
+        for (const el of elements) {
+            if (!(el instanceof Element) || !el.isConnected) {
+                continue;
+            }
+
+            if (el.hasAttribute('data-message-author-role')) {
+                expanded.push(el);
+                continue;
+            }
+
+            const explicitBubbles = Array.from(el.querySelectorAll('[data-message-author-role]'))
+                .filter((candidate): candidate is Element => candidate instanceof Element)
+                .filter((candidate) => !this.isEditArtifactBubble(candidate));
+
+            if (explicitBubbles.length > 0) {
+                expanded.push(...explicitBubbles);
+                continue;
+            }
+
+            expanded.push(el);
+        }
+
+        return expanded;
+    }
+
     private normalizeMessageElements(elements: Element[]): Element[] {
-        const filtered = elements
+        const filtered = this.expandMessageElements(elements)
             .filter(el => el instanceof Element && this.isLikelyMessageTurn(el));
 
         // Remove nested elements (keep top-level message turns).
@@ -260,7 +293,12 @@ class ChatGPTAdapter extends BaseAdapter {
         const conversation = this.detectConversation();
         if (!conversation) return [];
 
-        let elements = this.normalizeMessageElements(queryAllWithFallbacks(conversation.container, this.selectors.messageBlock));
+        const explicitRoleElements = Array.from(conversation.container.querySelectorAll('[data-message-author-role]'));
+
+        let elements = this.normalizeMessageElements([
+            ...queryAllWithFallbacks(conversation.container, this.selectors.messageBlock),
+            ...explicitRoleElements,
+        ]);
 
         if (elements.length === 0) {
             const directSections = Array.from(conversation.container.querySelectorAll(':scope > section'))
@@ -305,13 +343,7 @@ class ChatGPTAdapter extends BaseAdapter {
         }
 
         // Filter out "You said" artifacts
-        const validBubbles = bubbles.filter(el => {
-            const text = el.textContent?.trim() || '';
-            // Heuristic: "You said" block often starts with this text
-            // And usually has a specific class, but we use text to be safe
-            if (text.startsWith('You said:')) return false;
-            return true;
-        });
+        const validBubbles = bubbles.filter((el) => !this.isEditArtifactBubble(el));
 
         if (validBubbles.length > 0) {
             // Return the last valid bubble (most recent edit)
