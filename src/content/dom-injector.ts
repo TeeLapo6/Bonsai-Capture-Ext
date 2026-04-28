@@ -266,6 +266,14 @@ export class DOMInjector {
             return this.createFallbackContainer(messageEl);
         }
 
+        // FORCE BOTTOM PLACEMENT FOR CHATGPT
+        // Generic Tailwind selectors (.flex.gap-1 etc.) and the button-based fallback
+        // below both target ChatGPT's hover-controls row (copy/thumbs/edit buttons),
+        // placing the insert button inside that row instead of after the message text.
+        if (this.hostname.includes('chatgpt.com') || this.hostname.includes('chat.openai.com') || this.hostname.includes('chat.com')) {
+            return this.createFallbackContainer(messageEl);
+        }
+
         // GROK: .action-buttons is a sibling of message-bubble, not a descendant
         if (this.hostname.includes('grok.com')) {
             const actionButtons = messageEl.parentElement?.querySelector('.action-buttons');
@@ -318,6 +326,18 @@ export class DOMInjector {
 
         // FALLBACK: Create a simple container if no action bar found
         return this.createFallbackContainer(messageEl);
+    }
+
+    private findChatGPTDeepResearchReferenceNode(messageEl: Element): Element | null {
+        const frame = messageEl.querySelector(
+            'iframe[title="internal://deep-research"], iframe[src*="deep_research"], iframe[src*="oaiusercontent.com"]'
+        );
+
+        if (!(frame instanceof HTMLIFrameElement)) {
+            return null;
+        }
+
+        return frame.parentElement?.parentElement ?? frame.parentElement ?? frame;
     }
 
     private createFallbackContainer(messageEl: Element): Element {
@@ -385,6 +405,28 @@ export class DOMInjector {
                 messageEl.appendChild(container);
             }
             return container;
+        }
+
+        if (this.hostname.includes('chatgpt.com') || this.hostname.includes('chat.openai.com') || this.hostname.includes('chat.com')) {
+            const referenceNode = this.findChatGPTDeepResearchReferenceNode(messageEl);
+            if (referenceNode) {
+                const next = referenceNode.nextElementSibling;
+                if (next && next.classList.contains('bonsai-fallback-container')) {
+                    return next;
+                }
+
+                const container = document.createElement('div');
+                container.className = 'bonsai-action-container bonsai-fallback-container';
+                container.style.cssText = 'display: flex; justify-content: flex-end; padding: 8px 0 0; margin-bottom: 16px; width: 100%; box-sizing: border-box;';
+
+                if (referenceNode.parentNode) {
+                    referenceNode.parentNode.insertBefore(container, referenceNode.nextSibling);
+                } else {
+                    messageEl.appendChild(container);
+                }
+
+                return container;
+            }
         }
 
         if (this.hostname.includes('gemini.google.com')) {

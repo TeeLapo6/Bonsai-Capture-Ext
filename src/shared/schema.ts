@@ -21,6 +21,7 @@ export type ProviderName =
     | 'anthropic'
     | 'google'
     | 'xai'
+    | 'moonshot'
     | 'unknown';
 
 export type ConfidenceLevel = 'observed' | 'inferred' | 'unknown';
@@ -147,10 +148,16 @@ export interface ConversationSource {
     capture_version: string;
 }
 
+export interface SourceFolder {
+    name: string;
+    url?: string;
+}
+
 export interface ConversationGraph {
     conversation_id: string;
     title?: string;
     source: ConversationSource;
+    source_folder?: SourceFolder;
     provenance: Provenance;
     messages: MessageNode[];
     artifacts: ArtifactNode[];

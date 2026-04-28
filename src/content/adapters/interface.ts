@@ -37,6 +37,8 @@ export interface ParsedConversation {
     url: string;
     container: Element;
     title?: string;
+    projectName?: string;
+    projectUrl?: string;
 }
 
 export interface ExtractedFrameContent {
@@ -200,22 +202,37 @@ export abstract class BaseAdapter implements ProviderAdapter {
 
     protected getArtifactDedupKey(artifact: ArtifactNode): string {
         const normalizedTitle = this.cleanArtifactText(artifact.title ?? '').toLowerCase();
-        const content = typeof artifact.content === 'string'
-            ? artifact.content.slice(0, 1200)
-            : JSON.stringify(artifact.content).slice(0, 1200);
+        const rawContent = typeof artifact.content === 'string'
+            ? artifact.content
+            : JSON.stringify(artifact.content);
+
+        // For HTML artifacts, skip the <head> boilerplate when building the
+        // content slice — Claude iframes that share the same React bundle can
+        // have identical first 1200+ chars but different body/vis-container
+        // content.  Focusing on the body region makes the dedup key genuinely
+        // unique per visualization.
+        let contentSlice: string;
+        if (typeof artifact.content === 'string' && /^\s*</.test(artifact.content)) {
+            const bodyStart = rawContent.toLowerCase().indexOf('<body');
+            const bodyEnd = rawContent.toLowerCase().lastIndexOf('</body>');
+            const bodyContent = bodyStart !== -1 && bodyEnd !== -1
+                ? rawContent.slice(bodyStart, bodyEnd + 7)
+                : rawContent;
+            contentSlice = `${bodyContent.length}|${bodyContent.slice(0, 4000)}`;
+        } else {
+            contentSlice = `${rawContent.length}|${rawContent.slice(0, 1200)}`;
+        }
+
         const contentText = typeof artifact.content === 'string'
             ? this.cleanArtifactText(artifact.content.replace(/<[^>]+>/g, ' '))
             : '';
         const hasSubstantialCapturedContent = contentText.length >= 80;
 
-        // Prefer content-first deduping when we captured meaningful inline content so
-        // opener-based and visible-panel-based captures of the same artifact collapse
-        // even if only one path exposed a download/view URL.
         if (artifact.type === 'code_artifact' || hasSubstantialCapturedContent) {
             return [
                 artifact.type,
                 normalizedTitle,
-                content,
+                contentSlice,
             ].join('|');
         }
 
@@ -224,7 +241,7 @@ export abstract class BaseAdapter implements ProviderAdapter {
             normalizedTitle,
             artifact.view_url ?? '',
             artifact.source_url ?? '',
-            content,
+            contentSlice,
         ].join('|');
     }
 
@@ -274,9 +291,16 @@ export abstract class BaseAdapter implements ProviderAdapter {
             }
 
             if (artifact.type === 'deep_research') {
-                // Only include deep_research in the appendix if it has a linkable URL;
-                // phantom artifacts captured from stale/cross-conversation iframes lack URLs.
-                return Boolean(artifact.view_url || artifact.source_url);
+                // Include deep_research artifacts when they have a stable URL OR when
+                // they already carry meaningful captured content for the appendix.
+                const content = typeof artifact.content === 'string'
+                    ? artifact.content.replace(/<[^>]+>/g, ' ').trim()
+                    : '';
+                const title = (artifact.title ?? '').trim();
+                const hasMeaningfulContent = content.length > Math.max(80, title.length + 24)
+                    && content !== title;
+
+                return Boolean(artifact.view_url || artifact.source_url || hasMeaningfulContent);
             }
 
             if (artifact.type === 'file') {
@@ -333,12 +357,7 @@ export abstract class BaseAdapter implements ProviderAdapter {
 
         const GENERIC_LABEL = /^deep\s+research\s+report$/i;
         const artifactTitleLower = (artifact.title ?? '').toLowerCase();
-        const escapeHtml = (value: string): string => value
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#39;');
+        let replaced = false;
 
         for (let i = 0; i < message.content_blocks.length; i++) {
             const block = message.content_blocks[i];
@@ -348,8 +367,16 @@ export abstract class BaseAdapter implements ProviderAdapter {
             if (!GENERIC_LABEL.test(rawText) && rawText.toLowerCase() !== artifactTitleLower) continue;
             message.content_blocks[i] = {
                 type: 'markdown',
-                value: `<a href="#artifact-${artifact.artifact_id}">${escapeHtml(rawText)}</a>`,
+                value: `[${rawText}](#artifact-${artifact.artifact_id})`,
             };
+            replaced = true;
+        }
+
+        if (!replaced && msgArtifacts.some((candidate) => candidate.type === 'deep_research')) {
+            message.content_blocks.push({
+                type: 'markdown',
+                value: `[Deep research report](#artifact-${artifact.artifact_id})`,
+            });
         }
     }
 
@@ -821,6 +848,9 @@ export abstract class BaseAdapter implements ProviderAdapter {
             'class',
             'colspan',
             'rowspan',
+            'data-bonsai-source-index',
+            'data-bonsai-sources',
+            'data-bonsai-observed-sources',
         ]);
 
         clone.querySelectorAll('*').forEach((node) => {
@@ -830,6 +860,56 @@ export abstract class BaseAdapter implements ProviderAdapter {
                     node.removeAttribute(attr.name);
                 }
             });
+        });
+
+        // Normalize provider citation elements into bracket markers.
+        // ChatGPT deep research iframes render citations as <sup><a href="#source-N">N</a></sup>,
+        // bare <sup>N</sup>, or purely aesthetic Tailwind spans (span.rounded-full.cursor-pointer).
+        // Convert these to 【N†ref】 bracket markers so the downstream citation pipeline
+        // (CITATION_PATTERN) can recognize and rewrite them.
+        clone.querySelectorAll('sup, button, [class*="cit"], [data-testid*="cit"], span.rounded-full.cursor-pointer').forEach((sup) => {
+            const anchors = Array.from(sup.querySelectorAll('a[href]'));
+            let rawText = '';
+            let valid = true;
+
+            if (anchors.length > 0) {
+                const numbers: string[] = [];
+                for (const a of anchors) {
+                    const href = a.getAttribute('href') ?? '';
+                    if (!href.startsWith('#') && href !== '') {
+                        valid = false;
+                        break;
+                    }
+                    const text = (a.textContent || '').trim();
+                    if (!/^\d+$/.test(text)) {
+                        valid = false;
+                        break;
+                    }
+                    numbers.push(text);
+                }
+                if (valid && numbers.length > 0) {
+                    rawText = numbers.join(',');
+                }
+            } else {
+                rawText = (sup.textContent || '').trim();
+                if (!/^\d+(?:[,、 ]\d+)*$/.test(rawText)) {
+                    valid = false;
+                }
+            }
+
+            if (!valid || !rawText) {
+                return;
+            }
+
+            console.log(`[Bonsai Citation Debug] Converting element to bracket marker:`, {
+                original: sup.outerHTML,
+                rawText,
+                marker: `【${rawText}†ref】`
+            });
+
+            // Build the bracket marker: 【4†ref】 or 【4,5†ref】
+            const marker = `【${rawText}†ref】`;
+            sup.replaceWith(document.createTextNode(marker));
         });
 
         // Normalize provider-specific code markup into plain semantic pre/code blocks.
@@ -862,7 +942,8 @@ export abstract class BaseAdapter implements ProviderAdapter {
             }
         });
 
-        return clone.innerHTML.trim();
+        const finalHtml = clone.innerHTML.trim();
+        return finalHtml;
     }
 
     subscribeNewMessages(callback: (el: Element) => void): () => void {
@@ -911,6 +992,14 @@ export abstract class BaseAdapter implements ProviderAdapter {
                 captured_at: new Date().toISOString(),
                 capture_version: '0.1.0'
             },
+            ...(conversation.projectName
+                ? {
+                    source_folder: {
+                        name: conversation.projectName,
+                        ...(conversation.projectUrl ? { url: conversation.projectUrl } : {}),
+                    },
+                }
+                : {}),
             provenance,
             messages: [],
             artifacts: []

@@ -23,9 +23,15 @@
     ]
   },
   "host_permissions": [
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "https://localhost/*",
+    "https://127.0.0.1/*",
+    "https://*.bonsai.app/*",
     "https://chatgpt.com/*",
     "https://chat.openai.com/*",
     "https://claude.ai/*",
+    "https://*.claudemcpcontent.com/*",
     "https://gemini.google.com/*",
     "https://grok.com/*",
     "https://*.oaiusercontent.com/*",
@@ -73,6 +79,16 @@
         "content/claude.js"
       ],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://*.claudemcpcontent.com/*"
+      ],
+      "js": [
+        "content/iframe_extractor.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
     },
     {
       "matches": [

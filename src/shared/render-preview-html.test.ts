@@ -244,6 +244,206 @@ describe('renderConversationGraphToHtml', () => {
         expect(html).toContain('class="bonsai-deep-research"');
     });
 
+    it('preserves canonical 1..N source numbering for probe markdown deep research without remapping by citation order', () => {
+        // Probe fast-path assigns sources sequential indices 1..N matched to the rendered
+        // Sources panel. The inline markers already use those same indices. The render layer
+        // must NOT renumber them by citation order of first appearance.
+        const graph: ConversationGraph = {
+            conversation_id: 'conv_probe_markdown',
+            title: 'Probe Markdown Capture',
+            source: {
+                provider_site: 'chatgpt.com',
+                url: 'https://chatgpt.com/c/example-probe',
+                captured_at: '2026-04-23T12:31:00.000Z',
+                capture_version: '0.1.0',
+            },
+            provenance: {
+                provider: 'openai',
+                confidence: 'observed',
+            },
+            messages: [
+                {
+                    message_id: 'msg_probe_1',
+                    role: 'assistant',
+                    sequence: 0,
+                    origin: {
+                        provider: 'openai',
+                        confidence: 'observed',
+                    },
+                    content_blocks: [],
+                    artifact_ids: ['artifact_probe_research'],
+                    deep_link: { url: 'https://chatgpt.com/c/example-probe' },
+                },
+            ],
+            artifacts: [
+                {
+                    artifact_id: 'artifact_probe_research',
+                    type: 'deep_research',
+                    title: 'Deep research probe markdown report',
+                    mime_type: 'text/markdown',
+                    content: [
+                        '## Executive Summary',
+                        '',
+                        'Market size is $110B【1†L111-L116】 and collaboration alone is $73B【3†L114-L122】 while knowledge management is $23B【2†L63-L71】.',
+                        '',
+                        '<section data-bonsai-sources="true">',
+                        '<h2>Sources</h2>',
+                        '<ul>',
+                        '<li data-bonsai-source-index="1"><sup>1</sup> <a href="https://example.com/productivity" target="_blank" rel="noreferrer">Productivity Market Report</a></li>',
+                        '<li data-bonsai-source-index="2"><sup>2</sup> <a href="https://example.com/knowledge" target="_blank" rel="noreferrer">Knowledge Management Report</a></li>',
+                        '<li data-bonsai-source-index="3"><sup>3</sup> <a href="https://example.com/collaboration" target="_blank" rel="noreferrer">Collaboration Market Report</a></li>',
+                        '</ul>',
+                        '</section>',
+                    ].join('\n'),
+                    source_message_id: 'msg_probe_1',
+                    exportable: true,
+                },
+            ],
+        };
+
+        const html = renderConversationGraphToHtml(graph);
+
+        // Inline citations must use canonical numbers, NOT citation-order numbers.
+        // 【1†…】 = source 1 → display 1  (not remapped to "1" since it happens to be first cited, fine)
+        // 【3†…】 = source 3 → display 3  (not remapped to "2" even though cited second inline)
+        // 【2†…】 = source 2 → display 2  (not remapped to "3" even though cited third inline)
+        expect(html).toContain('href="#artifact-artifact_probe_research-source-3">3</a></sup>');
+        expect(html).toContain('href="#artifact-artifact_probe_research-source-2">2</a></sup>');
+        expect(html).toContain('href="#artifact-artifact_probe_research-source-1">1</a></sup>');
+
+        // Source list display labels must also stay canonical.
+        expect(html).toContain('artifact-artifact_probe_research-source-1"><sup>1</sup>');
+        expect(html).toContain('artifact-artifact_probe_research-source-2"><sup>2</sup>');
+        expect(html).toContain('artifact-artifact_probe_research-source-3"><sup>3</sup>');
+
+        // Must NOT remap citation-order: source 3 (cited second) must not show as "2".
+        expect(html).not.toContain('href="#artifact-artifact_probe_research-source-3">2</a></sup>');
+        expect(html).not.toContain('href="#artifact-artifact_probe_research-source-2">3</a></sup>');
+    });
+
+    it('remaps deep research HTML citation display numbers sequentially for capture preview', () => {
+        const graph: ConversationGraph = {
+            conversation_id: 'conv_4b',
+            title: 'Research HTML Capture',
+            source: {
+                provider_site: 'chatgpt.com',
+                url: 'https://chatgpt.com/c/example-html',
+                captured_at: '2026-04-02T12:31:00.000Z',
+                capture_version: '0.1.0',
+            },
+            provenance: {
+                provider: 'openai',
+                confidence: 'observed',
+            },
+            messages: [
+                {
+                    message_id: 'msg_html_1',
+                    role: 'assistant',
+                    sequence: 0,
+                    origin: {
+                        provider: 'openai',
+                        confidence: 'observed',
+                    },
+                    content_blocks: [],
+                    artifact_ids: ['artifact_html_research'],
+                    deep_link: { url: 'https://chatgpt.com/c/example-html' },
+                },
+            ],
+            artifacts: [
+                {
+                    artifact_id: 'artifact_html_research',
+                    type: 'deep_research',
+                    title: 'Deep research HTML report',
+                    mime_type: 'text/html',
+                    content: [
+                        '<section>',
+                        '<p>Prioritize segment A first[25†L197-L203], then segment B[17†L10-L12].</p>',
+                        '<section data-bonsai-sources="true">',
+                        '<h2>Sources</h2>',
+                        '<ul>',
+                        '<li data-bonsai-source-index="17"><sup>17</sup> <a href="https://example.com/b" target="_blank" rel="noreferrer">Source B</a></li>',
+                        '<li data-bonsai-source-index="25"><sup>25</sup> <a href="https://example.com/a" target="_blank" rel="noreferrer">Source A</a></li>',
+                        '</ul>',
+                        '</section>',
+                        '</section>',
+                    ].join(''),
+                    source_message_id: 'msg_html_1',
+                    exportable: true,
+                },
+            ],
+        };
+
+        const html = renderConversationGraphToHtml(graph);
+
+        expect(html).toContain('href="#artifact-artifact_html_research-source-25"');
+        expect(html).toContain('href="#artifact-artifact_html_research-source-17"');
+        expect(html).toContain('title="Source 1, L197-L203"');
+        expect(html).toContain('title="Source 2, L10-L12"');
+        expect(html).toContain('artifact-artifact_html_research-source-17"><sup>2</sup>');
+        expect(html).toContain('artifact-artifact_html_research-source-25"><sup>1</sup>');
+    });
+
+    it('preserves explicit ChatGPT data-citation-index numbering in HTML deep research artifacts', () => {
+        const graph: ConversationGraph = {
+            conversation_id: 'conv_explicit_citations',
+            title: 'Explicit Citation Capture',
+            source: {
+                provider_site: 'chatgpt.com',
+                url: 'https://chatgpt.com/c/example-explicit',
+                captured_at: '2026-04-23T12:31:00.000Z',
+                capture_version: '0.1.0',
+            },
+            provenance: {
+                provider: 'openai',
+                confidence: 'observed',
+            },
+            messages: [
+                {
+                    message_id: 'msg_explicit_1',
+                    role: 'assistant',
+                    sequence: 0,
+                    origin: {
+                        provider: 'openai',
+                        confidence: 'observed',
+                    },
+                    content_blocks: [],
+                    artifact_ids: ['artifact_explicit_research'],
+                    deep_link: { url: 'https://chatgpt.com/c/example-explicit' },
+                },
+            ],
+            artifacts: [
+                {
+                    artifact_id: 'artifact_explicit_research',
+                    type: 'deep_research',
+                    title: 'Deep research HTML report',
+                    mime_type: 'text/html',
+                    content: [
+                        '<section>',
+                        '<p>Executive summary<sup data-citation-index="1"><span>1</span></sup> and market sizing<sup data-citation-index="10"><span>10</span></sup>.</p>',
+                        '<section data-bonsai-sources="true">',
+                        '<h2>Sources</h2>',
+                        '<ul>',
+                        '<li data-bonsai-source-index="1"><sup>1</sup> <a href="https://example.com/1" target="_blank" rel="noreferrer">Source 1</a></li>',
+                        '<li data-bonsai-source-index="10"><sup>10</sup> <a href="https://example.com/10" target="_blank" rel="noreferrer">Source 10</a></li>',
+                        '</ul>',
+                        '</section>',
+                        '</section>',
+                    ].join(''),
+                    source_message_id: 'msg_explicit_1',
+                    exportable: true,
+                },
+            ],
+        };
+
+        const html = renderConversationGraphToHtml(graph);
+
+        expect(html).toContain('href="#artifact-artifact_explicit_research-source-1">1</a></sup>');
+        expect(html).toContain('href="#artifact-artifact_explicit_research-source-10">10</a></sup>');
+        expect(html).toContain('artifact-artifact_explicit_research-source-1"><sup>1</sup>');
+        expect(html).toContain('artifact-artifact_explicit_research-source-10"><sup>10</sup>');
+        expect(html).not.toContain('href="#artifact-artifact_explicit_research-source-10">2</a></sup>');
+    });
+
     it('renders linked Claude document artifacts in the appendix without duplicating them inline', () => {
         const graph: ConversationGraph = {
             conversation_id: 'conv_6',

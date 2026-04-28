@@ -18,7 +18,10 @@ function escapeHtml(value: string): string {
 
 export function exportToHtml(graph: ConversationGraph, options?: RenderConversationOptions): string {
     const title = escapeHtml(graph.title ?? 'Conversation');
-    const body = renderConversationGraphToHtml(graph, options);
+    const body = renderConversationGraphToHtml(graph, {
+        ...options,
+        interactiveHtmlMode: 'render',
+    });
 
     return `<!doctype html>
 <html lang="en">

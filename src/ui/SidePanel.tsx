@@ -26,6 +26,7 @@ import { toBonsaiImportPackage } from '../shared/bonsai-adapter';
 import { exportToTOONString } from '../shared/exporters/toon';
 import { markdownToHtml } from '../shared/markdown-to-html';
 import { renderConversationGraphToHtml } from '../shared/render-preview-html';
+import bonsaiLogo from '../../../Bonsai-WebUI/src/components/icons/bonsai.png';
 import {
     DEFAULT_PROVIDER_CAPTURE_SETTINGS,
     normalizeProviderCaptureSettings,
@@ -246,9 +247,54 @@ function extractConversationIdFromUrl(url: string): string | null {
     return null;
 }
 
+type SourceFolder = NonNullable<ConversationGraph['source_folder']>;
+
+function buildSourceFolder(name?: string, url?: string): SourceFolder | undefined {
+    const trimmedName = name?.trim();
+    if (!trimmedName) return undefined;
+
+    const trimmedUrl = url?.trim();
+    return trimmedUrl ? { name: trimmedName, url: trimmedUrl } : { name: trimmedName };
+}
+
+function getSharedSourceFolder(graphs: ConversationGraph[]): SourceFolder | undefined {
+    if (graphs.length === 0) return undefined;
+
+    const folders = graphs.map((graph) => buildSourceFolder(graph.source_folder?.name, graph.source_folder?.url));
+    if (folders.some((folder) => !folder)) return undefined;
+
+    const uniqueNames = new Set(folders.map((folder) => folder!.name));
+    if (uniqueNames.size !== 1) return undefined;
+
+    const uniqueUrls = new Set(
+        folders
+            .map((folder) => folder!.url)
+            .filter((value): value is string => Boolean(value))
+    );
+
+    if (uniqueUrls.size > 1) return undefined;
+
+    const [name] = uniqueNames;
+    const [urlValue] = uniqueUrls;
+    return urlValue ? { name, url: urlValue } : { name };
+}
+
+function applySharedSourceFolder(graph: ConversationGraph, graphs: ConversationGraph[]): ConversationGraph {
+    const sharedSourceFolder = getSharedSourceFolder(graphs);
+    if (sharedSourceFolder) {
+        return {
+            ...graph,
+            source_folder: sharedSourceFolder,
+        };
+    }
+
+    const { source_folder: _ignored, ...rest } = graph;
+    return rest;
+}
+
 function matchesBulkCaptureTarget(graph: ConversationGraph, item: BulkItem): boolean {
     const graphId = extractConversationIdFromUrl(graph.source.url);
-    const itemId  = extractConversationIdFromUrl(item.url) ?? item.id.toLowerCase();
+    const itemId = extractConversationIdFromUrl(item.url) ?? item.id.toLowerCase();
     if (graphId && itemId) return graphId === itemId;
     // Fallback: full path comparison
     return normalizeConversationPath(graph.source.url) === normalizeConversationPath(item.url);
@@ -260,8 +306,11 @@ function isGenericBulkCaptureTitle(title: string | undefined): boolean {
 }
 
 function normalizeBulkCapturedGraph(graph: ConversationGraph, item: BulkItem): ConversationGraph {
+    const sourceFolder = buildSourceFolder(item.projectName, item.projectUrl) ?? graph.source_folder;
+
     return {
         ...graph,
+        ...(sourceFolder ? { source_folder: sourceFolder } : {}),
         title: isGenericBulkCaptureTitle(graph.title) ? item.title : graph.title,
     };
 }
@@ -308,7 +357,7 @@ function diagnoseBulkCaptureRejection(graph: ConversationGraph | undefined, item
     const urlMatch = matchesBulkCaptureTarget(graph, item);
     if (!urlMatch) {
         const graphId = extractConversationIdFromUrl(graph.source.url) ?? normalizeConversationPath(graph.source.url);
-        const itemId  = extractConversationIdFromUrl(item.url) ?? item.id;
+        const itemId = extractConversationIdFromUrl(item.url) ?? item.id;
         return (
             `URL mismatch — captured ID "${graphId}" ≠ expected "${itemId}". ` +
             `Full captured path: "${normalizeConversationPath(graph.source.url)}".`
@@ -459,12 +508,12 @@ const HistoryBatchItem = ({
         const fullMarkdown = markdowns.join('\n\n---\n\n');
 
         const mergedMessages = group.flatMap(g => g.data.messages);
-        const mergedGraph: ConversationGraph = {
+        const mergedGraph = applySharedSourceFolder({
             ...group[0].data,
             title: `Batch Capture (${group.length}) - ${new Date(group[0].timestamp).toLocaleDateString()}`,
             messages: mergedMessages,
             artifacts: group.flatMap(g => g.data.artifacts || [])
-        };
+        }, group.map((item) => item.data));
 
         const mergedItem: CapturedItem = {
             id: 'batch-merged',
@@ -593,6 +642,11 @@ export function SidePanel() {
     const [isDiscoveringProjects, setIsDiscoveringProjects] = useState(false);
     const [lightboxImage, setLightboxImage] = useState<string | null>(null);
     const [exportBatch, setExportBatch] = useState<CapturedItem[] | null>(null);
+    // Batch pagination state — one conversation loaded at a time
+    const [batchItems, setBatchItems] = useState<CapturedItem[]>([]);
+    const [batchIndex, setBatchIndex] = useState(0);
+    const [batchDropdownOpen, setBatchDropdownOpen] = useState(false);
+    const batchDropdownRef = useRef<HTMLDivElement>(null);
     const [searchTerm, setSearchTerm] = useState('');
     const [captureSearchQuery, setCaptureSearchQuery] = useState('');
     const [captureSearchMiss, setCaptureSearchMiss] = useState(false);
@@ -757,13 +811,52 @@ export function SidePanel() {
     }, [captureMetadataOptions]);
 
     const loadCaptureIntoEditor = useCallback((graph: ConversationGraph) => {
+        // Clear batch pagination — a new individual capture replaces the batch
+        setBatchItems([]);
+        setBatchIndex(0);
+        setBatchDropdownOpen(false);
+        setExportBatch(null);
+
         setCurrentCapture(graph);
 
         if (editor) {
-            const html = renderConversationGraphToHtml(graph, { artifactMode: captureMetadataOptions.artifactMode });
+            const html = renderConversationGraphToHtml(graph, {
+                artifactMode: captureMetadataOptions.artifactMode,
+                interactiveHtmlMode: 'code',
+            });
             editor.commands.setContent(html);
         }
     }, [editor, captureMetadataOptions.artifactMode]);
+
+    // Navigate within the current batch (does NOT clear batch state)
+    const navigateBatch = useCallback((index: number) => {
+        if (batchItems.length === 0) return;
+        const clamped = Math.max(0, Math.min(index, batchItems.length - 1));
+        setBatchIndex(clamped);
+        setBatchDropdownOpen(false);
+
+        const item = batchItems[clamped];
+        setCurrentCapture(item.data);
+        if (editor) {
+            const html = renderConversationGraphToHtml(item.data, {
+                artifactMode: captureMetadataOptions.artifactMode,
+                interactiveHtmlMode: 'code',
+            });
+            editor.commands.setContent(html);
+        }
+    }, [batchItems, editor, captureMetadataOptions.artifactMode]);
+
+    // Close the batch combobox dropdown when user clicks outside
+    useEffect(() => {
+        if (!batchDropdownOpen) return;
+        const handleClickOutside = (e: MouseEvent) => {
+            if (batchDropdownRef.current && !batchDropdownRef.current.contains(e.target as Node)) {
+                setBatchDropdownOpen(false);
+            }
+        };
+        document.addEventListener('mousedown', handleClickOutside);
+        return () => document.removeEventListener('mousedown', handleClickOutside);
+    }, [batchDropdownOpen]);
 
     const handleCaptureFind = useCallback((direction: 'forward' | 'backward' = 'forward') => {
         const query = captureSearchQuery.trim();
@@ -1512,18 +1605,16 @@ export function SidePanel() {
                 }
             }
 
-            // Auto-load the captured batch into the export panel from our in-memory list
+            // Auto-load the captured batch for paginated viewing & export
             // (avoids the race with chrome.storage.local async write).
             if (batchCapturedItems.length > 0) {
                 setExportBatch(batchCapturedItems);
-                const mergedMessages = batchCapturedItems.flatMap(g => g.data.messages);
-                const mergedGraph: ConversationGraph = {
-                    ...batchCapturedItems[0].data,
-                    title: `Batch Capture (${batchCapturedItems.length}) - ${new Date().toLocaleDateString()}`,
-                    messages: mergedMessages,
-                    artifacts: batchCapturedItems.flatMap(g => g.data.artifacts || [])
-                };
-                setCurrentCapture(mergedGraph);
+                setBatchItems(batchCapturedItems);
+                setBatchIndex(0);
+                setBatchDropdownOpen(false);
+                // Load only the first conversation
+                const first = batchCapturedItems[0];
+                setCurrentCapture(first.data);
             }
 
         } catch (e) {
@@ -1847,6 +1938,84 @@ export function SidePanel() {
                             )}
                         </div>
 
+                        {/* Batch Navigation Bar — shown when a batch is loaded */}
+                        {batchItems.length > 0 && (
+                            <div className="batch-nav-bar">
+                                <button
+                                    className="btn btn-ghost btn-icon batch-nav-prev"
+                                    disabled={batchIndex <= 0}
+                                    onClick={() => navigateBatch(batchIndex - 1)}
+                                    title="Previous conversation"
+                                    aria-label="Previous conversation"
+                                >
+                                    ‹
+                                </button>
+
+                                <div className="batch-nav-combobox" ref={batchDropdownRef}>
+                                    <button
+                                        className="batch-nav-current"
+                                        onClick={() => setBatchDropdownOpen(prev => !prev)}
+                                        title="Select conversation"
+                                    >
+                                        <span className="batch-nav-label">
+                                            {batchIndex + 1}. {batchItems[batchIndex]?.data.title ?? 'Untitled'}
+                                        </span>
+                                        <span className="batch-nav-count">
+                                            ({batchItems.length})
+                                        </span>
+                                        <span className="batch-nav-chevron">{batchDropdownOpen ? '▲' : '▼'}</span>
+                                    </button>
+
+                                    {batchDropdownOpen && (
+                                        <div className="batch-nav-dropdown">
+                                            <input
+                                                type="text"
+                                                className="batch-nav-search"
+                                                placeholder="Search conversations…"
+                                                autoFocus
+                                                onChange={(e) => {
+                                                    // Filter is local to the dropdown — use a data attribute for simplicity
+                                                    const list = e.target.closest('.batch-nav-dropdown')?.querySelector('.batch-nav-list');
+                                                    if (!list) return;
+                                                    const query = e.target.value.toLowerCase();
+                                                    Array.from(list.children).forEach((child) => {
+                                                        const el = child as HTMLElement;
+                                                        const text = el.textContent?.toLowerCase() ?? '';
+                                                        el.style.display = text.includes(query) ? '' : 'none';
+                                                    });
+                                                }}
+                                                onKeyDown={(e) => {
+                                                    if (e.key === 'Escape') setBatchDropdownOpen(false);
+                                                }}
+                                            />
+                                            <div className="batch-nav-list">
+                                                {batchItems.map((item, idx) => (
+                                                    <button
+                                                        key={item.id}
+                                                        className={`batch-nav-option ${idx === batchIndex ? 'active' : ''}`}
+                                                        onClick={() => navigateBatch(idx)}
+                                                    >
+                                                        <span className="batch-nav-option-num">{idx + 1}.</span>
+                                                        {item.data.title ?? 'Untitled'}
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+
+                                <button
+                                    className="btn btn-ghost btn-icon batch-nav-next"
+                                    disabled={batchIndex >= batchItems.length - 1}
+                                    onClick={() => navigateBatch(batchIndex + 1)}
+                                    title="Next conversation"
+                                    aria-label="Next conversation"
+                                >
+                                    ›
+                                </button>
+                            </div>
+                        )}
+
                         {/* Editor */}
                         <div className="editor-container">
                             <EditorContent editor={editor} className="editor" />
@@ -2014,13 +2183,21 @@ export function SidePanel() {
                                                 groupKey={key}
                                                 group={group}
                                                 markdownOptions={{ artifactMode: captureMetadataOptions.artifactMode }}
-                                                onSelectMarkdown={(markdown, mergedItem, batchItems) => {
-                                                    setExportBatch(batchItems);
-                                                    if (editor) {
-                                                        const html = markdownToHtml(markdown);
-                                                        editor.commands.setContent(html);
+                                                onSelectMarkdown={(_markdown, _mergedItem, batchItemsFromHistory) => {
+                                                    // Store batch for paginated viewing & export
+                                                    setExportBatch(batchItemsFromHistory);
+                                                    setBatchItems(batchItemsFromHistory);
+                                                    setBatchIndex(0);
+                                                    setBatchDropdownOpen(false);
+                                                    // Load only the first conversation into the editor
+                                                    const first = batchItemsFromHistory[0];
+                                                    if (first) {
+                                                        setCurrentCapture(first.data);
+                                                        if (editor) {
+                                                            const html = renderConversationGraphToHtml(first.data, { artifactMode: captureMetadataOptions.artifactMode });
+                                                            editor.commands.setContent(html);
+                                                        }
                                                     }
-                                                    setCurrentCapture(mergedItem.data);
                                                     setActiveTab('capture');
                                                 }}
                                                 onSelectSingle={(item) => {

@@ -1345,4 +1345,217 @@ describe('ClaudeAdapter code artifact capture', () => {
         expect(graph!.artifacts[0].artifact_id).toBe('artifact-visible-dedup');
         expect(String(graph!.artifacts[0].content)).toContain('This is the full plan content.');
     });
+
+    it('counts and captures four Claude inline iframe artifacts even when they share the same claudemcpcontent URL', async () => {
+        const adapter = new ClaudeAdapterClass();
+        document.body.innerHTML = `
+            <div id="main-content">
+                <div class="turn-wrapper">
+                    <div class="font-claude-response" id="msg-iframe-four">
+                        <div class="standard-markdown"><p>Here are the four visualizations.</p></div>
+                    </div>
+                    <div class="artifact-shell">
+                        <iframe src="https://viz.claudemcpcontent.com/render"></iframe>
+                        <iframe src="https://viz.claudemcpcontent.com/render"></iframe>
+                        <iframe src="https://viz.claudemcpcontent.com/render"></iframe>
+                        <iframe src="https://viz.claudemcpcontent.com/render"></iframe>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        const iframeRect = {
+            width: 320,
+            height: 220,
+            top: 0,
+            left: 0,
+            right: 320,
+            bottom: 220,
+            x: 0,
+            y: 0,
+            toJSON: () => ({}),
+        };
+        const iframes = Array.from(document.querySelectorAll('iframe')) as HTMLIFrameElement[];
+        iframes.forEach((iframe) => {
+            Object.defineProperty(iframe, 'getBoundingClientRect', {
+                configurable: true,
+                value: () => iframeRect,
+            });
+        });
+
+        const htmlByFrame = new Map(
+            iframes.map((iframe, index) => [
+                iframe,
+                `<html><body><div id="vis-container"><section><h1>Visualization ${index + 1}</h1><svg></svg><p>Distinct payload ${index + 1}</p></section></div></body></html>`,
+            ]),
+        );
+
+        vi.spyOn(adapter as any, 'waitForClaudeIframeReady').mockResolvedValue(true);
+        vi.spyOn(adapter as any, 'extractClaudeIframeVisContainerHtml').mockReturnValue(null);
+        vi.spyOn(adapter as any, 'getIframeContentViaPostMessage').mockImplementation(async (iframe: HTMLIFrameElement) => htmlByFrame.get(iframe) ?? null);
+
+        expect(adapter.getArtifactCount()).toBe(4);
+
+        const message = document.getElementById('msg-iframe-four') as Element;
+        const artifacts = await adapter.parseArtifacts(message);
+        const iframeArtifacts = artifacts.filter(
+            (candidate) => candidate.type === 'artifact_doc'
+                && candidate.mime_type === 'text/html'
+                && String(candidate.content).includes('vis-container'),
+        );
+
+        expect(iframeArtifacts).toHaveLength(4);
+        expect(new Set(iframeArtifacts.map((candidate) => String(candidate.content))).size).toBe(4);
+        expect(iframeArtifacts.every((candidate) => String(candidate.content).includes('Distinct payload'))).toBe(true);
+    });
+
+    it('keeps Claude inline iframe capture scoped to the current message turn', async () => {
+        const adapter = new ClaudeAdapterClass();
+        document.body.innerHTML = `
+            <div id="main-content">
+                <div class="turn-wrapper">
+                    <div class="font-claude-response" id="msg-iframe-scope-1">
+                        <div class="standard-markdown"><p>First set of visualizations.</p></div>
+                    </div>
+                    <div class="artifact-shell">
+                        <iframe src="https://viz.claudemcpcontent.com/render"></iframe>
+                        <iframe src="https://viz.claudemcpcontent.com/render"></iframe>
+                        <iframe src="https://viz.claudemcpcontent.com/render"></iframe>
+                        <iframe src="https://viz.claudemcpcontent.com/render"></iframe>
+                    </div>
+                </div>
+                <div data-testid="user-message">Show me a variant.</div>
+                <div class="turn-wrapper">
+                    <div class="font-claude-response" id="msg-iframe-scope-2">
+                        <div class="standard-markdown"><p>Second set.</p></div>
+                    </div>
+                    <div class="artifact-shell">
+                        <iframe src="https://viz.claudemcpcontent.com/render"></iframe>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        const iframeRect = {
+            width: 320,
+            height: 220,
+            top: 0,
+            left: 0,
+            right: 320,
+            bottom: 220,
+            x: 0,
+            y: 0,
+            toJSON: () => ({}),
+        };
+        const iframes = Array.from(document.querySelectorAll('iframe')) as HTMLIFrameElement[];
+        iframes.forEach((iframe) => {
+            Object.defineProperty(iframe, 'getBoundingClientRect', {
+                configurable: true,
+                value: () => iframeRect,
+            });
+        });
+
+        const htmlByFrame = new Map(
+            iframes.map((iframe, index) => [
+                iframe,
+                `<html><body><div id="vis-container"><section><p>Scoped iframe ${index + 1}</p><canvas></canvas></section></div></body></html>`,
+            ]),
+        );
+
+        vi.spyOn(adapter as any, 'waitForClaudeIframeReady').mockResolvedValue(true);
+        vi.spyOn(adapter as any, 'extractClaudeIframeVisContainerHtml').mockReturnValue(null);
+        vi.spyOn(adapter as any, 'getIframeContentViaPostMessage').mockImplementation(async (iframe: HTMLIFrameElement) => htmlByFrame.get(iframe) ?? null);
+
+        const firstMessage = document.getElementById('msg-iframe-scope-1') as Element;
+        const secondMessage = document.getElementById('msg-iframe-scope-2') as Element;
+
+        const firstArtifacts = (await adapter.parseArtifacts(firstMessage)).filter(
+            (candidate) => candidate.type === 'artifact_doc' && candidate.mime_type === 'text/html',
+        );
+        const secondArtifacts = (await adapter.parseArtifacts(secondMessage)).filter(
+            (candidate) => candidate.type === 'artifact_doc' && candidate.mime_type === 'text/html',
+        );
+
+        expect(firstArtifacts).toHaveLength(4);
+        expect(secondArtifacts).toHaveLength(1);
+        expect(firstArtifacts.some((candidate) => String(candidate.content).includes('Scoped iframe 5'))).toBe(false);
+        expect(String(secondArtifacts[0].content)).toContain('Scoped iframe 5');
+    });
+
+    it('matches Claude iframe postMessage responses by both iframe id and request id', async () => {
+        const adapter = new ClaudeAdapterClass();
+        const iframe = document.createElement('iframe');
+        iframe.setAttribute('src', 'https://viz.claudemcpcontent.com/render');
+        document.body.appendChild(iframe);
+
+        const iframeRect = {
+            width: 320,
+            height: 220,
+            top: 0,
+            left: 0,
+            right: 320,
+            bottom: 220,
+            x: 0,
+            y: 0,
+            toJSON: () => ({}),
+        };
+        Object.defineProperty(iframe, 'getBoundingClientRect', {
+            configurable: true,
+            value: () => iframeRect,
+        });
+
+        const mockWindow = {
+            postMessage: vi.fn((payload: { iframeId: string; requestId: string }, origin: string) => {
+                window.setTimeout(() => {
+                    window.dispatchEvent(new MessageEvent('message', {
+                        source: window,
+                        data: {
+                            type: 'BONSAI_IFRAME_CONTENT_RESPONSE',
+                            iframeId: payload.iframeId,
+                            requestId: payload.requestId,
+                            success: true,
+                            html: '<html><body><div id="vis-container">wrong source</div></body></html>',
+                        },
+                    }));
+
+                    window.dispatchEvent(new MessageEvent('message', {
+                        source: mockWindow as unknown as MessageEventSource,
+                        data: {
+                            type: 'BONSAI_IFRAME_CONTENT_RESPONSE',
+                            iframeId: payload.iframeId,
+                            requestId: 'wrong-request-id',
+                            success: true,
+                            html: '<html><body><div id="vis-container">wrong request</div></body></html>',
+                        },
+                    }));
+
+                    window.dispatchEvent(new MessageEvent('message', {
+                        source: mockWindow as unknown as MessageEventSource,
+                        data: {
+                            type: 'BONSAI_IFRAME_CONTENT_RESPONSE',
+                            iframeId: payload.iframeId,
+                            requestId: payload.requestId,
+                            success: true,
+                            html: '<html><body><div id="vis-container">correct match</div></body></html>',
+                        },
+                    }));
+                }, 0);
+
+                expect(origin).toBe('https://viz.claudemcpcontent.com');
+            }),
+        };
+        Object.defineProperty(iframe, 'contentWindow', {
+            configurable: true,
+            value: mockWindow,
+        });
+
+        const html = await (adapter as any).tryGetIframeContentViaPostMessageOnce(iframe, 100);
+        const sentPayload = mockWindow.postMessage.mock.calls[0]?.[0] as { iframeId: string; requestId: string };
+
+        expect(sentPayload.iframeId).toMatch(/^bonsai-claude-frame-/);
+        expect(sentPayload.requestId).toMatch(/^bonsai-iframe-/);
+        expect(html).toContain('correct match');
+        expect(html).not.toContain('wrong source');
+        expect(html).not.toContain('wrong request');
+    });
 });

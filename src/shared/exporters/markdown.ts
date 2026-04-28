@@ -6,6 +6,11 @@
  */
 
 import type { ConversationGraph, ContentBlock, MessageNode, ArtifactNode } from '../schema';
+import {
+    buildResearchCitationDisplayMap,
+    getResearchCitationDisplayNumber,
+    rewriteResearchSourceDisplayNumbers,
+} from '../research-citations';
 
 export interface MarkdownExportOptions {
     /** 'inline' renders artifact content inside messages; 'appendix' puts a link and renders at end */
@@ -47,25 +52,29 @@ function getSourceAnchorId(artifactId: string, sourceIndex: string): string {
     return `artifact-${artifactId}-source-${sourceIndex}`;
 }
 
-function rewriteResearchCitations(text: string, artifactId: string): string {
+function rewriteResearchCitations(text: string, artifactId: string, displayMap: Map<number, number>): string {
     const citationPattern = /[\[【](\d+)(?:†([^\]】]+))?[\]】]/g;
     return text.replace(citationPattern, (_match, sourceIndex: string, lineInfo?: string) => {
-        const title = lineInfo ? `Source ${sourceIndex}, ${lineInfo}` : `Source ${sourceIndex}`;
+        const displayIndex = getResearchCitationDisplayNumber(sourceIndex, displayMap);
+        const title = lineInfo ? `Source ${displayIndex}, ${lineInfo}` : `Source ${displayIndex}`;
         const href = `#${getSourceAnchorId(artifactId, sourceIndex)}`;
-        return `<sup class="bonsai-citation" title="${title.replace(/"/g, '&quot;')}"><a href="${href}">${sourceIndex}</a></sup>`;
+        return `<sup class="bonsai-citation" title="${title.replace(/"/g, '&quot;')}"><a href="${href}">${displayIndex}</a></sup>`;
     });
 }
 
 function renderDeepResearchContentForMarkdown(artifact: ArtifactNode, content: string): string {
     const trimmed = content.trim();
     if (!trimmed) return '';
+    const displayMap = buildResearchCitationDisplayMap(trimmed);
 
     const withSourceIds = trimmed.replace(
         /<(li|span)([^>]*)data-bonsai-source-index="(\d+)"([^>]*)>/g,
         (_match, tagName: string, before: string, sourceIndex: string, after: string) => `<${tagName}${before}data-bonsai-source-index="${sourceIndex}"${after} id="${getSourceAnchorId(artifact.artifact_id, sourceIndex)}">`
     );
 
-    return rewriteResearchCitations(withSourceIds, artifact.artifact_id);
+    const withDisplayLabels = rewriteResearchSourceDisplayNumbers(withSourceIds, displayMap);
+
+    return rewriteResearchCitations(withDisplayLabels, artifact.artifact_id, displayMap);
 }
 
 /**

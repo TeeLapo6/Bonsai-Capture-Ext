@@ -14,6 +14,27 @@ chrome.action.onClicked.addListener(async (tab) => {
 // Set up side panel behavior
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 
+function normalizeBonsaiHost(rawHost: string): URL {
+    const trimmedHost = rawHost.trim();
+    if (!trimmedHost) {
+        throw new Error('Bonsai host is empty. Use a URL like http://localhost:3000');
+    }
+
+    const hasScheme = /^[a-zA-Z][a-zA-Z\d+.-]*:\/\//.test(trimmedHost);
+    const defaultScheme = /^(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(trimmedHost)
+        ? 'http://'
+        : 'https://';
+
+    let parsedUrl: URL;
+    try {
+        parsedUrl = new URL(hasScheme ? trimmedHost : `${defaultScheme}${trimmedHost}`);
+    } catch {
+        throw new Error('Invalid Bonsai host URL. Use a full URL like http://localhost:3000');
+    }
+
+    return new URL(parsedUrl.origin);
+}
+
 // Listen for messages from content scripts
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // =========================================================================
@@ -46,7 +67,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     return;
                 }
 
-                const response = await fetch(`${host}/api/import/conversation`, {
+                const normalizedHost = normalizeBonsaiHost(host);
+                const importUrl = new URL('/api/import/conversation', normalizedHost);
+
+                const response = await fetch(importUrl.toString(), {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -64,7 +88,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 const result = await response.json();
                 sendResponse({ success: true, data: result });
             } catch (error) {
-                sendResponse({ success: false, error: String(error) });
+                const messageText = error instanceof Error ? error.message : String(error);
+                if (/Failed to fetch/i.test(messageText)) {
+                    sendResponse({
+                        success: false,
+                        error: `${messageText}. Reload the extension after rebuilding so the updated host permissions apply, then verify the Bonsai Host URL in Settings.`,
+                    });
+                    return;
+                }
+
+                sendResponse({ success: false, error: messageText });
             }
         })();
         return true; // async sendResponse

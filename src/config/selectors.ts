@@ -24,7 +24,7 @@ export interface ProviderSelectors {
 export const PROVIDER_SELECTORS: Record<string, ProviderSelectors> = {
   'chatgpt.com': {
     conversationContainer: '[data-testid="conversation-turn-list"], [data-testid="chat-history"], div[role="log"], main .flex-col',
-    messageBlock: 'section[data-testid*="conversation-turn"], section[data-testid*="chat-message"], section, article[data-testid^="conversation-turn"], div[data-testid^="conversation-turn"], [data-testid="chat-message"], div[role="listitem"], div[class*="group"]',
+    messageBlock: 'section[data-testid*="conversation-turn"], section[data-testid*="chat-message"], article[data-testid^="conversation-turn"], div[data-testid^="conversation-turn"], [data-testid="chat-message"], div[role="listitem"]',
     roleAttribute: 'data-message-author-role',
     codeBlock: 'pre code, .code-block code',
     codeLanguage: '.code-header span, pre > div.flex span',
@@ -54,7 +54,7 @@ export const PROVIDER_SELECTORS: Record<string, ProviderSelectors> = {
   },
   'chat.openai.com': {
     conversationContainer: '[data-testid="conversation-turn-list"], [data-testid="chat-history"], div[role="log"], main .flex-col',
-    messageBlock: 'section[data-testid*="conversation-turn"], section[data-testid*="chat-message"], section, article[data-testid^="conversation-turn"], div[data-testid^="conversation-turn"], [data-testid="chat-message"], div[role="listitem"], div[class*="group"]',
+    messageBlock: 'section[data-testid*="conversation-turn"], section[data-testid*="chat-message"], article[data-testid^="conversation-turn"], div[data-testid^="conversation-turn"], [data-testid="chat-message"], div[role="listitem"]',
     roleAttribute: 'data-message-author-role',
     codeBlock: 'pre code, .code-block code',
     codeLanguage: '.code-header span',

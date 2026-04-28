@@ -71,6 +71,26 @@ export class ClaudeAdapter extends BaseAdapter {
             }
         });
 
+        this.listMessages().forEach((messageEl) => {
+            this.getClaudeInlineInteractiveIframes(messageEl).forEach((iframe) => {
+                const identity = this.getClaudeInlineIframeIdentity(iframe);
+                if (identity) {
+                    artifactIdentities.add(identity);
+                }
+            });
+        });
+
+        if (artifactIdentities.size === 0) {
+            // Fallback for Claude DOM variants where message selectors fail but iframe
+            // visualizations are still present in the page.
+            this.getClaudeInlineInteractiveIframes(document.body).forEach((iframe) => {
+                const identity = this.getClaudeInlineIframeIdentity(iframe);
+                if (identity) {
+                    artifactIdentities.add(identity);
+                }
+            });
+        }
+
         return artifactIdentities.size;
     }
 
@@ -780,6 +800,603 @@ export class ClaudeAdapter extends BaseAdapter {
         // Prefer the most specific artifact node. Once we widened the search to sibling scopes,
         // keeping ancestors causes wrapper divs to win over the actual card/open-button node.
         return deduped.filter((candidate, _index, all) => !all.some((other) => other !== candidate && candidate.contains(other)));
+    }
+
+    private getClaudeArtifactCandidateScopes(messageEl: Element): Element[] {
+        const scopes: Element[] = [messageEl];
+
+        const isUserMessage = messageEl.matches('[data-testid="user-message"], .font-user-message')
+            || messageEl.getAttribute('data-role') === 'user'
+            || messageEl.getAttribute('data-message-role') === 'user';
+
+        if (isUserMessage) {
+            return scopes;
+        }
+
+        const siblingContainer = messageEl.parentElement;
+        if (!siblingContainer) {
+            return scopes;
+        }
+
+        const messageSelector = this.getClaudeArtifactMessageSelectors();
+        let pastSelf = false;
+
+        for (const child of Array.from(siblingContainer.children)) {
+            if (!(child instanceof Element)) continue;
+            if (child === messageEl) {
+                pastSelf = true;
+                continue;
+            }
+            if (!pastSelf) continue;
+
+            // Stop at the next message turn.
+            if (child.matches(messageSelector)) break;
+            scopes.push(child);
+        }
+
+        return scopes;
+    }
+
+    private getClaudeInlineInteractiveRoots(messageEl: Element): Element[] {
+        const roots: Element[] = [];
+
+        for (const scope of this.getClaudeArtifactCandidateScopes(messageEl)) {
+            const visualNodes = Array.from(scope.querySelectorAll('canvas, svg'))
+                .filter((node): node is Element => node instanceof Element)
+                .filter((node) => this.isVisibleElement(node))
+                .filter((node) => {
+                    const rect = node.getBoundingClientRect();
+                    return rect.width >= 120 && rect.height >= 80;
+                });
+
+            for (const visual of visualNodes) {
+                let current: Element | null = visual;
+                let bestRoot: Element | null = null;
+
+                for (let depth = 0; current && depth < 8; depth += 1) {
+                    if (!scope.contains(current)) {
+                        break;
+                    }
+
+                    const textLen = this.cleanArtifactText(current.textContent ?? '').length;
+                    const hasControls = current.querySelector('input[type="range"], button, [role="tab"], .tab-row, canvas, svg') !== null;
+                    const hasSignals = /chart|token|traditional|bonsai|scaling|comparison|branch/i.test(
+                        `${current.getAttribute('aria-label') ?? ''} ${current.textContent ?? ''}`
+                    );
+
+                    if ((textLen >= 120 && hasControls) || hasSignals) {
+                        bestRoot = current;
+                    }
+
+                    current = current.parentElement;
+                }
+
+                if (bestRoot) {
+                    roots.push(bestRoot);
+                }
+            }
+        }
+
+        return roots
+            .filter((candidate, index, all) => all.indexOf(candidate) === index)
+            .filter((candidate, _index, all) => !all.some((other) => other !== candidate && candidate.contains(other)));
+    }
+
+    private getClaudeInlineInteractiveIframes(messageEl: Element): HTMLIFrameElement[] {
+        const candidates: HTMLIFrameElement[] = [];
+
+        for (const scope of this.getClaudeArtifactCandidateScopes(messageEl)) {
+            const scopedIframes = Array.from(scope.querySelectorAll('iframe'))
+                .filter((node): node is HTMLIFrameElement => node instanceof HTMLIFrameElement)
+                .filter((iframe) => this.isVisibleElement(iframe));
+
+            for (const iframe of scopedIframes) {
+                const rect = iframe.getBoundingClientRect();
+                if (rect.width < 120 || rect.height < 80) {
+                    continue;
+                }
+
+                // Skip obvious chrome/navigation frames.
+                if (iframe.closest('nav, header, footer, [role="navigation"]')) {
+                    continue;
+                }
+
+                candidates.push(iframe);
+            }
+        }
+
+        return candidates.filter((candidate, index, all) => all.indexOf(candidate) === index);
+    }
+
+    private getClaudeVisContainerElement(doc: Document): Element | null {
+        try {
+            const xpathResult = doc.evaluate(
+                '/html/body/div[@id="vis-container"]',
+                doc,
+                null,
+                XPathResult.FIRST_ORDERED_NODE_TYPE,
+                null,
+            );
+            if (xpathResult.singleNodeValue instanceof Element) {
+                return xpathResult.singleNodeValue;
+            }
+        } catch {
+            // Fallback to querySelector below.
+        }
+
+        return doc.querySelector('body > div#vis-container');
+    }
+
+    private extractClaudeIframeVisContainerHtmlFromDoc(doc: Document): string | null {
+        const visRoot = this.getClaudeVisContainerElement(doc);
+        if (!visRoot) {
+            return null;
+        }
+
+        const html = visRoot.outerHTML?.trim() ?? '';
+        return html || null;
+    }
+
+    private extractClaudeIframeVisContainerHtml(iframe: HTMLIFrameElement): string | null {
+        try {
+            const contentDoc = iframe.contentDocument;
+            if (contentDoc) {
+                const html = this.extractClaudeIframeVisContainerHtmlFromDoc(contentDoc);
+                if (html) {
+                    return html;
+                }
+            }
+        } catch {
+            // Cross-origin frame access will throw; fallback paths handle this.
+        }
+
+        const srcDoc = iframe.getAttribute('srcdoc') ?? '';
+        if (!srcDoc.trim()) {
+            return null;
+        }
+
+        try {
+            const parsed = new DOMParser().parseFromString(srcDoc, 'text/html');
+            return this.extractClaudeIframeVisContainerHtmlFromDoc(parsed);
+        } catch {
+            return null;
+        }
+    }
+
+    private getOrAssignClaudeInlineIframeId(iframe: HTMLIFrameElement): string {
+        const existingId = iframe.getAttribute('data-bonsai-claude-iframe-id');
+        if (existingId) {
+            return existingId;
+        }
+
+        const uuid = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+        const frameId = `bonsai-claude-frame-${uuid}`;
+
+        iframe.setAttribute('data-bonsai-claude-iframe-id', frameId);
+        return frameId;
+    }
+
+    private getClaudeIframeTargetOrigin(iframe: HTMLIFrameElement): string {
+        const src = iframe.getAttribute('src') ?? '';
+        if (!src) {
+            return '*';
+        }
+
+        try {
+            return new URL(src, window.location.href).origin;
+        } catch {
+            return '*';
+        }
+    }
+
+    private getClaudeInlineIframeIdentity(iframe: HTMLIFrameElement): string | null {
+        return `iframe|${this.getOrAssignClaudeInlineIframeId(iframe)}`;
+    }
+
+    private async waitForClaudeIframeReady(iframe: HTMLIFrameElement, timeoutMs = 3000): Promise<boolean> {
+        const startTime = Date.now();
+
+        const scrollIntoView = () => {
+            try {
+                iframe.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            } catch {
+                // ignore
+            }
+        };
+
+        // Defensive scroll to trigger any viewport-based lazy loading
+        scrollIntoView();
+
+        // ── Strategy 1: Same-origin / srcdoc iframe ──
+        const checkLocalVisContainer = (): boolean => {
+            try {
+                const doc = iframe.contentDocument;
+                if (doc) {
+                    return this.getClaudeVisContainerElement(doc) !== null;
+                }
+            } catch {
+                // cross-origin or sandboxed
+            }
+
+            const srcDoc = iframe.getAttribute('srcdoc') ?? '';
+            if (srcDoc.trim().length > 0) {
+                try {
+                    const parsed = new DOMParser().parseFromString(srcDoc, 'text/html');
+                    return this.getClaudeVisContainerElement(parsed) !== null;
+                } catch {
+                    return false;
+                }
+            }
+
+            return false;
+        };
+
+        if (checkLocalVisContainer()) {
+            return true;
+        }
+
+        // ── Strategy 2: Cross-origin iframe via postMessage ──
+        const isLikelyCrossOrigin = (() => {
+            const src = iframe.getAttribute('src') ?? '';
+            if (!src) return false;
+            try {
+                const iframeOrigin = new URL(src, window.location.href).origin;
+                return iframeOrigin !== window.location.origin;
+            } catch {
+                return false;
+            }
+        })();
+
+        if (isLikelyCrossOrigin) {
+            const postMessageResult = await this.getIframeContentViaPostMessage(iframe, timeoutMs);
+            if (postMessageResult) {
+                return true;
+            }
+        }
+
+        // ── Strategy 3: Fallback polling for same-origin frames ──
+        return new Promise((resolve) => {
+            let settled = false;
+            const finish = (ready: boolean) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                clearInterval(pollInterval);
+                clearTimeout(timeoutHandle);
+                try {
+                    observer.disconnect();
+                } catch {
+                    // ignore
+                }
+                resolve(ready);
+            };
+
+            const observer = new MutationObserver(() => {
+                if (checkLocalVisContainer()) {
+                    finish(true);
+                }
+            });
+
+            try {
+                const doc = iframe.contentDocument;
+                if (doc) {
+                    const target = doc.body ?? doc.documentElement;
+                    if (target) {
+                        observer.observe(target, { childList: true, subtree: true });
+                    }
+                } else {
+                    observer.observe(iframe, { attributes: true, attributeFilter: ['srcdoc', 'src'] });
+                }
+            } catch {
+                try {
+                    observer.observe(iframe, { attributes: true, attributeFilter: ['srcdoc', 'src'] });
+                } catch {
+                    // polling alone will have to suffice
+                }
+            }
+
+            let scrollAttempts = 0;
+            const pollInterval = window.setInterval(() => {
+                if (checkLocalVisContainer()) {
+                    finish(true);
+                    return;
+                }
+
+                const elapsed = Date.now() - startTime;
+                if (elapsed > timeoutMs * 0.4 && scrollAttempts < 2) {
+                    scrollAttempts += 1;
+                    scrollIntoView();
+                }
+
+                if (elapsed > timeoutMs) {
+                    finish(false);
+                }
+            }, 120);
+
+            const timeoutHandle = window.setTimeout(() => finish(false), timeoutMs + 50);
+        });
+    }
+
+    /**
+     * Extract iframe content via postMessage for cross-origin frames.
+     * The iframe-extractor.ts content script runs inside the frame (all_frames: true)
+     * and responds with the #vis-container HTML.
+     *
+     * Retries up to 3 times because Chrome content-script injection is racy:
+     * the extractor may not have loaded when the first message is sent.
+     */
+    private async getIframeContentViaPostMessage(
+        iframe: HTMLIFrameElement,
+        timeoutMs = 5000
+    ): Promise<string | null> {
+        const MAX_RETRIES = 3;
+        const RETRY_DELAY_MS = 400;
+
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
+            const result = await this.tryGetIframeContentViaPostMessageOnce(iframe, timeoutMs);
+            if (result) {
+                return result;
+            }
+
+            console.log(`Bonsai [Claude-Iframe]: postMessage attempt ${attempt}/${MAX_RETRIES} failed, retrying in ${RETRY_DELAY_MS}ms...`);
+            if (attempt < MAX_RETRIES) {
+                await this.delay(RETRY_DELAY_MS);
+            }
+        }
+
+        return null;
+    }
+
+    private generateClaudeIframeRequestId(): string {
+        const uuid = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+
+        return `bonsai-iframe-${uuid}`;
+    }
+
+    private async tryGetIframeContentViaPostMessageOnce(
+        iframe: HTMLIFrameElement,
+        timeoutMs: number
+    ): Promise<string | null> {
+        const iframeId = this.getOrAssignClaudeInlineIframeId(iframe);
+        const requestId = this.generateClaudeIframeRequestId();
+        const targetWindow = iframe.contentWindow;
+        const targetOrigin = this.getClaudeIframeTargetOrigin(iframe);
+
+        if (!targetWindow) {
+            return null;
+        }
+
+        return new Promise((resolve) => {
+            let settled = false;
+            let timeoutHandle = 0;
+
+            const finish = (html: string | null) => {
+                if (settled) return;
+                settled = true;
+                window.removeEventListener('message', messageHandler);
+                clearTimeout(timeoutHandle);
+                resolve(html);
+            };
+
+            const messageHandler = (event: MessageEvent) => {
+                if (event.source !== targetWindow) {
+                    return;
+                }
+
+                const data = event.data as Record<string, unknown> | null;
+                if (
+                    !data
+                    || data.type !== 'BONSAI_IFRAME_CONTENT_RESPONSE'
+                    || data.iframeId !== iframeId
+                    || data.requestId !== requestId
+                ) {
+                    return;
+                }
+
+                if (data.success === true && typeof data.html === 'string') {
+                    finish(data.html);
+                } else {
+                    finish(null);
+                }
+            };
+
+            window.addEventListener('message', messageHandler);
+
+            // Scroll iframe into view to trigger any lazy loading
+            try {
+                iframe.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            } catch {
+                // ignore
+            }
+
+            // Post message to iframe content window
+            try {
+                targetWindow.postMessage(
+                    {
+                        type: 'BONSAI_REQUEST_IFRAME_CONTENT',
+                        iframeId,
+                        requestId,
+                        timeoutMs,
+                    },
+                    targetOrigin
+                );
+            } catch {
+                finish(null);
+                return;
+            }
+
+            timeoutHandle = window.setTimeout(() => finish(null), timeoutMs + 100);
+        });
+    }
+
+    private async captureClaudeInlineIframeArtifacts(messageEl: Element): Promise<ArtifactNode[]> {
+        const artifacts: ArtifactNode[] = [];
+        const seen = new Set<string>();
+        const rawIframes = this.getClaudeInlineInteractiveIframes(messageEl);
+
+        console.group('Bonsai [Claude-Iframe]: captureClaudeInlineIframeArtifacts');
+        console.log('Initial iframe candidates found:', rawIframes.length);
+
+        if (rawIframes.length === 0) {
+            console.log('No iframe candidates found in message scope.');
+            console.groupEnd();
+            return artifacts;
+        }
+
+        // Stabilization: wait for lazy-loaded iframe contents to resolve
+        const stabilizationResults = await Promise.all(
+            rawIframes.map(async (iframe) => {
+                const rawSrc = iframe.getAttribute('src') ?? '';
+                const srcdoc = iframe.getAttribute('srcdoc') ?? '';
+                const isLikelyCrossOrigin = (() => {
+                    if (!rawSrc) return false;
+                    try {
+                        return new URL(rawSrc, window.location.href).origin !== window.location.origin;
+                    } catch {
+                        return false;
+                    }
+                })();
+
+                const stabilizationTimeout = isLikelyCrossOrigin ? 5000 : 3000;
+                const isReady = await this.waitForClaudeIframeReady(iframe, stabilizationTimeout);
+
+                let hasVisContainer = false;
+                try {
+                    const doc = iframe.contentDocument;
+                    if (doc) {
+                        hasVisContainer = this.getClaudeVisContainerElement(doc) !== null;
+                    }
+                } catch {
+                    // cross-origin / sandboxed
+                }
+                if (!hasVisContainer && srcdoc.trim().length > 0) {
+                    try {
+                        const parsed = new DOMParser().parseFromString(srcdoc, 'text/html');
+                        hasVisContainer = this.getClaudeVisContainerElement(parsed) !== null;
+                    } catch {
+                        // ignore
+                    }
+                }
+                console.log('Iframe state:', {
+                    isReady,
+                    isLikelyCrossOrigin,
+                    src: rawSrc.slice(0, 120),
+                    srcdocLength: srcdoc.length,
+                    hasVisContainer,
+                    width: iframe.getBoundingClientRect().width,
+                    height: iframe.getBoundingClientRect().height,
+                });
+                return { iframe, isReady, hasVisContainer, isLikelyCrossOrigin, rawSrc };
+            })
+        );
+
+        // Keep iframes that are ready OR have a vis-container locally.
+        // Also keep cross-origin iframes with a non-empty src and reasonable
+        // dimensions — the extraction loop will retry postMessage.
+        const iframes = stabilizationResults
+            .filter((r) => {
+                if (r.isReady || r.hasVisContainer) return true;
+                if (r.isLikelyCrossOrigin && r.rawSrc && r.iframe.getBoundingClientRect().width >= 120) {
+                    return true;
+                }
+                return false;
+            })
+            .map((r) => r.iframe);
+
+        console.log('Iframes ready after stabilization:', iframes.length);
+
+        if (iframes.length === 0) {
+            console.warn('Bonsai [Claude-Iframe]: No iframes stabilized within timeout.');
+            console.groupEnd();
+            return artifacts;
+        }
+
+        for (const iframe of iframes) {
+            let html = this.extractClaudeIframeVisContainerHtml(iframe);
+            const rawSrc = iframe.getAttribute('src') ?? '';
+            let normalizedSrc: string | undefined;
+
+            if (rawSrc) {
+                try {
+                    normalizedSrc = new URL(rawSrc, window.location.href).href;
+                } catch {
+                    normalizedSrc = rawSrc;
+                }
+            }
+
+            // ── Cross-origin fallback: use postMessage via iframe-extractor.ts ──
+            if (!html && rawSrc) {
+                const isLikelyCrossOrigin = (() => {
+                    try {
+                        const iframeOrigin = new URL(rawSrc, window.location.href).origin;
+                        return iframeOrigin !== window.location.origin;
+                    } catch {
+                        return false;
+                    }
+                })();
+
+                if (isLikelyCrossOrigin) {
+                    console.log('Bonsai [Claude-Iframe]: Attempting cross-origin extraction via postMessage', { src: rawSrc.slice(0, 120) });
+                    html = await this.getIframeContentViaPostMessage(iframe, 10000);
+                }
+            }
+
+            if (!html) {
+                console.warn('Bonsai [Claude-Iframe]: Could not extract vis-container HTML for iframe', { src: rawSrc.slice(0, 120) });
+                continue;
+            }
+
+            // ── Foolproof body-focused dedup ──
+            // Claude iframes share identical React boilerplate in <head>
+            // (scripts, styles).  html.slice(0, 2000) would match two
+            // different visualizations that share the same bundle.  Focus
+            // the dedup key on the body content where actual differences live.
+            const loweredHtml = html.toLowerCase();
+            const bodyStart = loweredHtml.indexOf('<body');
+            const bodyEnd = loweredHtml.lastIndexOf('</body>');
+            const bodySlice = bodyStart !== -1 && bodyEnd !== -1
+                ? html.slice(bodyStart, bodyEnd + 7)
+                : html;
+            // Use both body length and a large body-prefix slice.  The length
+            // alone distinguishes artifacts of different sizes even when the
+            // first several KB are structurally similar.  The body prefix
+            // includes #vis-container content past the React bundle.
+            const dedupeKey = `${bodySlice.length}|${bodySlice.slice(0, 4000)}`;
+            if (seen.has(dedupeKey)) {
+                continue;
+            }
+            seen.add(dedupeKey);
+
+            const title = this.cleanArtifactText(
+                iframe.getAttribute('title')
+                ?? iframe.getAttribute('aria-label')
+                ?? 'Inline interactive iframe'
+            ) || 'Inline interactive iframe';
+
+            console.log('Bonsai [Claude-Iframe]: Captured artifact', { title, htmlLength: html.length });
+
+            artifacts.push({
+                artifact_id: crypto.randomUUID(),
+                type: 'artifact_doc',
+                title,
+                mime_type: 'text/html',
+                content: html,
+                source_message_id: '',
+                source_url: normalizedSrc,
+                view_url: window.location.href,
+                exportable: true,
+            });
+        }
+
+        console.log('Bonsai [Claude-Iframe]: Total iframe artifacts captured:', artifacts.length);
+        console.groupEnd();
+
+        return artifacts;
     }
 
     private getClaudeArtifactPanelRoot(expectedTitle?: string, strictTitleMatch = false): Element | null {
@@ -1507,11 +2124,16 @@ export class ClaudeAdapter extends BaseAdapter {
             const finalUrl = fetched.finalUrl || candidateUrl;
             const contentType = (fetched.contentType ?? '').split(';')[0].trim().toLowerCase();
             const parsedDocument = this.extractFetchedDocumentContent(fetched.text, finalUrl);
+            const preserveInteractiveHtml = contentType === 'text/html' && this.looksLikeInteractiveHtmlDocument(fetched.text);
 
-            let content = parsedDocument?.html ?? parsedDocument?.text ?? '';
-            let mimeType = parsedDocument?.html
+            let content = preserveInteractiveHtml
+                ? fetched.text
+                : (parsedDocument?.html ?? parsedDocument?.text ?? '');
+            let mimeType = preserveInteractiveHtml
                 ? 'text/html'
-                : (contentType || this.inferClaudeArtifactMimeType(options.title, parsedDocument?.text ?? fetched.text, finalUrl));
+                : (parsedDocument?.html
+                    ? 'text/html'
+                    : (contentType || this.inferClaudeArtifactMimeType(options.title, parsedDocument?.text ?? fetched.text, finalUrl)));
             let title = parsedDocument?.title ?? options.title;
 
             if (!content) {
@@ -1538,6 +2160,23 @@ export class ClaudeAdapter extends BaseAdapter {
         }
 
         return null;
+    }
+
+    private looksLikeInteractiveHtmlDocument(rawHtml: string): boolean {
+        const normalized = rawHtml.toLowerCase();
+        if (!normalized.includes('<script')) {
+            return false;
+        }
+
+        return normalized.includes('<canvas')
+            || normalized.includes('type="range"')
+            || normalized.includes("type='range'")
+            || normalized.includes('chart.js')
+            || normalized.includes('plotly')
+            || normalized.includes('d3')
+            || normalized.includes('addEventListener(')
+            || normalized.includes('oninput=')
+            || normalized.includes('onclick=');
     }
 
     private async installClaudeClipboardInterceptor(): Promise<boolean> {
@@ -2250,6 +2889,7 @@ export class ClaudeAdapter extends BaseAdapter {
             console.log('Bonsai: Detecting conversation...');
             let container = queryWithFallbacks(document, this.selectors.conversationContainer);
             console.log('Bonsai: Container probe:', container);
+            const projectInfo = this.getCurrentProjectInfo();
 
             // Deep Inspect Fallback: If URL matches but container missing, force a capture
             if (!container && window.location.href.includes('/chat/')) {
@@ -2268,7 +2908,9 @@ export class ClaudeAdapter extends BaseAdapter {
             return {
                 url: window.location.href,
                 container,
-                title: title || 'Claude Chat (Debug)'
+                title: title || 'Claude Chat (Debug)',
+                projectName: projectInfo?.name,
+                projectUrl: projectInfo?.url,
             };
         } catch (e) {
             console.error('Bonsai: Fatal error in detectConversation', e);
@@ -2279,6 +2921,34 @@ export class ClaudeAdapter extends BaseAdapter {
                 container: document.body
             };
         }
+    }
+
+    private getCurrentProjectInfo(): { name: string; url: string } | undefined {
+        const projectMatch = window.location.pathname.match(/(\/project\/[a-f0-9-]+)/i);
+        if (!projectMatch) return undefined;
+
+        const projectUrl = `${window.location.origin}${projectMatch[1]}`;
+        const projectLink = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href*="/project/"]'))
+            .find((link) => {
+                const href = link.getAttribute('href') || '';
+                if (/\/chat\//.test(href)) return false;
+
+                try {
+                    return new URL(href, window.location.origin).pathname === projectMatch[1];
+                } catch {
+                    return false;
+                }
+            });
+
+        let name = projectLink?.innerText?.trim() || projectLink?.textContent?.trim() || '';
+        name = name.split('\n')[0].trim();
+
+        if (!name) {
+            const uuidMatch = projectMatch[1].match(/\/project\/([a-f0-9-]+)/i);
+            name = uuidMatch ? `Project ${uuidMatch[1].slice(0, 8)}` : 'Unnamed Project';
+        }
+
+        return { name, url: projectUrl };
     }
 
     private extractConversationTitle(): string {
@@ -2293,8 +2963,9 @@ export class ClaudeAdapter extends BaseAdapter {
 
         const all = queryAllWithFallbacks(conversation.container, this.selectors.messageBlock);
 
-        if (all.length === 0 && (conversation.container === document.body || conversation.container === document.querySelector('main'))) {
-            // If in debug mode and no messages found, return header as dummy message to trigger artifact parsing
+        if (all.length === 0) {
+            // Claude DOM variant fallback: ensure at least one parse pass so artifact
+            // capture (including iframe/global scans) still executes.
             return [conversation.container];
         }
 
@@ -2303,8 +2974,14 @@ export class ClaudeAdapter extends BaseAdapter {
     }
 
     parseMessage(el: Element, sequence: number): MessageNode {
-        // If debug mode (body), force assistant role
-        if (el === document.body || el === document.querySelector('main')) {
+        const conversation = this.detectConversation();
+        const all = conversation ? queryAllWithFallbacks(conversation.container, this.selectors.messageBlock) : [];
+        const isSyntheticFallbackMessage = Boolean(conversation)
+            && all.length === 0
+            && el === conversation?.container;
+
+        // If debug/synthetic mode, force assistant role so visible artifacts can be attached.
+        if (el === document.body || el === document.querySelector('main') || isSyntheticFallbackMessage) {
             return createMessageNode('assistant', sequence, [], this.getDeepLink(el));
         }
 
@@ -2584,6 +3261,7 @@ export class ClaudeAdapter extends BaseAdapter {
 
     async parseArtifacts(el: Element): Promise<ArtifactNode[]> {
         const artifacts: ArtifactNode[] = [];
+        const scopes = this.getClaudeArtifactCandidateScopes(el);
 
         // DEBUG DUMP if we are capturing the main/body fallback
         if (el === document.body || el === document.querySelector('main')) {
@@ -2814,8 +3492,44 @@ export class ClaudeAdapter extends BaseAdapter {
             }
         }
 
-        // Look for images
-        el.querySelectorAll('img:not([role="presentation"]):not(.avatar)').forEach(img => {
+        // Capture inline interactive blocks as raw HTML artifacts so sidepanel/export
+        // can show high-fidelity source even when Claude doesn't expose an opener card.
+        const seenInteractiveRoots = new Set<string>();
+        this.getClaudeInlineInteractiveRoots(el).forEach((root) => {
+            const rawHtml = root.outerHTML?.trim() ?? '';
+            if (!rawHtml || rawHtml.length < 200) return;
+
+            const dedupeKey = rawHtml.slice(0, 1500);
+            if (seenInteractiveRoots.has(dedupeKey)) return;
+            seenInteractiveRoots.add(dedupeKey);
+
+            const title = this.cleanArtifactText(
+                root.getAttribute('aria-label')
+                ?? root.querySelector('h1, h2, h3, strong')?.textContent
+                ?? 'Inline interactive block'
+            ) || 'Inline interactive block';
+
+            artifacts.push({
+                artifact_id: crypto.randomUUID(),
+                type: 'artifact_doc',
+                title,
+                mime_type: 'text/html',
+                content: rawHtml,
+                source_message_id: '',
+                source_url: this.extractArtifactViewUrl(root) ?? undefined,
+                view_url: window.location.href,
+                exportable: true,
+            });
+        });
+
+        // Capture inline iframe-based interactive visualizations from Claude turns.
+        const iframeArtifacts = await this.captureClaudeInlineIframeArtifacts(el);
+        if (iframeArtifacts.length > 0) {
+            artifacts.push(...iframeArtifacts);
+        }
+
+        // Look for images across message + sibling scopes.
+        scopes.forEach((scope) => scope.querySelectorAll('img:not([role="presentation"]):not(.avatar)').forEach(img => {
             const src = img.getAttribute('src');
             if (!src) return;
             const viewUrl = this.extractArtifactViewUrl(img);
@@ -2831,7 +3545,58 @@ export class ClaudeAdapter extends BaseAdapter {
                 view_url: viewUrl,
                 exportable: true
             });
-        });
+        }));
+
+        // Capture inline interactive visuals (e.g., Chart.js canvases / inline SVG diagrams)
+        // so the sidepanel can render a static fallback image even when interactive HTML
+        // execution is blocked by the editor/CSP context.
+        const seenInlineVisuals = new Set<string>();
+
+        scopes.forEach((scope) => scope.querySelectorAll('canvas, svg').forEach((node) => {
+            if (!(node instanceof HTMLCanvasElement || node instanceof SVGSVGElement)) {
+                return;
+            }
+
+            if (!this.isVisibleElement(node)) {
+                return;
+            }
+
+            // Skip obvious UI chrome/icons.
+            if (node.closest('button, [role="button"], nav, header, .avatar, [data-testid*="avatar"], [aria-label*="avatar" i]')) {
+                return;
+            }
+
+            const rect = node.getBoundingClientRect();
+            if (rect.width < 120 || rect.height < 80) {
+                return;
+            }
+
+            const dataUrl = node instanceof HTMLCanvasElement
+                ? this.canvasToDataUrl(node)
+                : this.svgToDataUrl(node as SVGSVGElement);
+
+            if (!dataUrl) {
+                return;
+            }
+
+            const dedupeKey = `${node.tagName.toLowerCase()}|${Math.round(rect.width)}x${Math.round(rect.height)}|${dataUrl.slice(0, 256)}`;
+            if (seenInlineVisuals.has(dedupeKey)) {
+                return;
+            }
+            seenInlineVisuals.add(dedupeKey);
+
+            artifacts.push({
+                artifact_id: crypto.randomUUID(),
+                type: 'image',
+                title: node instanceof HTMLCanvasElement ? 'Interactive chart snapshot' : 'Interactive diagram snapshot',
+                mime_type: node instanceof HTMLCanvasElement ? 'image/png' : 'image/svg+xml',
+                content: dataUrl,
+                source_message_id: '',
+                source_url: this.extractArtifactViewUrl(node) ?? undefined,
+                view_url: window.location.href,
+                exportable: true,
+            });
+        }));
 
         return artifacts;
     }
@@ -2882,6 +3647,19 @@ export class ClaudeAdapter extends BaseAdapter {
                 view_url: this.extractArtifactViewUrl(img) ?? window.location.href,
                 exportable: true
             });
+        }
+
+        // Also scan document-level inline iframe visualizations in case message-scoped
+        // parsing missed them due Claude selector drift.
+        const iframeArtifacts = await this.captureClaudeInlineIframeArtifacts(document.body);
+        for (const artifact of iframeArtifacts) {
+            const dedupeKey = this.getArtifactDedupKey(artifact);
+            if (seenContent.has(dedupeKey)) {
+                continue;
+            }
+
+            seenContent.add(dedupeKey);
+            artifacts.push(artifact);
         }
 
         return artifacts;
@@ -3131,17 +3909,98 @@ export class ClaudeAdapter extends BaseAdapter {
         return items;
     }
 
+    /**
+     * Lightweight conversation fingerprint for detecting DOM changes during
+     * waitForConversationReady.  Avoids calling parseContentBlocks (which
+     * stamps data-bonsai-index attributes on live elements) so the poll
+     * loop stays zero-side-effect.
+     */
+    private getConversationFingerprint(): string {
+        const messages = this.listMessages();
+        if (messages.length === 0) return '';
+
+        const parts: string[] = [];
+        parts.push(`url:${window.location.href}`);
+        parts.push(`title:${document.title}`);
+        parts.push(`msgs:${messages.length}`);
+
+        const last = messages[messages.length - 1];
+        parts.push(`last:${last.textContent?.length ?? 0}`);
+
+        return parts.join('|');
+    }
+
+    /**
+     * Lightweight, read-only check: do any assistant message elements contain
+     * actual rendered text content (not just empty shells)?
+     */
+    private hasRenderedMessageContent(): boolean {
+        const messages = this.listMessages();
+        if (messages.length === 0) return false;
+
+        let foundAssistant = false;
+        for (const msg of messages) {
+            const role = this.detectRole(msg);
+            if (role !== 'assistant') continue;
+            foundAssistant = true;
+
+            const text = (msg.textContent ?? '').replace(/\s+/g, ' ').trim();
+            if (text.length > 20) return true;
+            // Canvas / SVG / iframe responses
+            if (msg.querySelector('canvas, svg, iframe')) return true;
+        }
+
+        return !foundAssistant;
+    }
+
+    private async waitForConversationReady(
+        targetId: string,
+        baselineFingerprint: string,
+        timeoutMs = 30000
+    ): Promise<boolean> {
+        const deadline = Date.now() + timeoutMs;
+        const stabilizeMs = 1500;
+        let lastFingerprint = '';
+        let lastChangeAt = 0;
+
+        while (Date.now() < deadline) {
+            const fingerprint = this.getConversationFingerprint();
+            const contentReady = this.hasRenderedMessageContent();
+
+            if (fingerprint && fingerprint !== baselineFingerprint && contentReady) {
+                if (fingerprint !== lastFingerprint) {
+                    lastFingerprint = fingerprint;
+                    lastChangeAt = Date.now();
+                } else if (Date.now() - lastChangeAt >= stabilizeMs) {
+                    return true;
+                }
+            }
+
+            await this.delay(250);
+        }
+
+        return false;
+    }
+
     async loadConversation(id: string): Promise<boolean> {
         if (window.location.href.includes(id)) {
-            return true;
+            const baseline = this.getConversationFingerprint();
+            return this.waitForConversationReady(id, baseline, 45000);
         }
 
         const sidebarLink = document.querySelector(`a[href*="${id}"]`) as HTMLElement | null;
         if (sidebarLink) {
+            const baseline = this.getConversationFingerprint();
             sidebarLink.click();
-            return true;
+            // Claude is an SPA — clicking a sidebar link triggers a client-side
+            // navigation that re-renders the conversation DOM.  We must wait for
+            // the new content to render before the capture fires.
+            return this.waitForConversationReady(id, baseline, 45000);
         }
 
+        // Full-page navigation: the current script context will be destroyed,
+        // so there is nothing to wait on.  The content script reloads on the
+        // new page and bulk-capture orchestration handles the rest.
         try {
             window.location.href = id;
             return true;

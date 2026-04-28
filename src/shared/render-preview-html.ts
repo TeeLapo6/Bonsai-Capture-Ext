@@ -1,8 +1,15 @@
 import type { ArtifactNode, ContentBlock, ConversationGraph, MessageNode } from './schema';
 import { markdownToHtml } from './markdown-to-html';
+import {
+    buildResearchCitationDisplayMap,
+    getResearchCitationDisplayNumber,
+    rewriteResearchSourceDisplayNumbers,
+    splitRawIndexes,
+} from './research-citations';
 
 export interface RenderConversationOptions {
     artifactMode?: 'inline' | 'appendix';
+    interactiveHtmlMode?: 'render' | 'code' | 'fallback';
 }
 
 const ROLE_LABELS: Record<MessageNode['role'], string> = {
@@ -101,6 +108,32 @@ const PREVIEW_STYLES = `<style data-bonsai-preview-styles="true">
     word-break: break-word;
 }
 
+sup.bonsai-citation {
+    font-size: 0.72em;
+    line-height: 1;
+    vertical-align: super;
+    margin: 0 0.08em;
+    white-space: nowrap;
+}
+
+sup.bonsai-citation a {
+    color: #1d4ed8;
+    text-decoration: none;
+    padding: 0.05em 0.22em;
+    border: 1px solid #bfdbfe;
+    border-radius: 3px;
+    background: #eff6ff;
+}
+
+sup.bonsai-citation a:hover {
+    background: #dbeafe;
+    text-decoration: none;
+}
+
+sup.bonsai-citation + sup.bonsai-citation {
+    margin-left: 0.05em;
+}
+
 .bonsai-artifact-index {
     margin: 0.8rem 0;
     padding: 0.6rem 1rem;
@@ -192,7 +225,47 @@ function shouldRenderArtifactAsMarkdown(artifact: ArtifactNode): boolean {
         || (artifact.type === 'deep_research' && typeof artifact.content === 'string' && mimeType !== 'text/html');
 }
 
-function rewriteResearchCitations(html: string, artifactId: string, sourceIndexes: Set<number>): string {
+function looksLikeInteractiveHtmlArtifact(artifact: ArtifactNode): boolean {
+    if (typeof artifact.content !== 'string') {
+        return false;
+    }
+
+    const mimeType = (artifact.mime_type ?? '').split(';')[0].trim().toLowerCase();
+    const content = artifact.content.toLowerCase();
+
+    if (!(mimeType === 'text/html' || /<(?:!doctype|html|body|main|section|div)\b/i.test(artifact.content))) {
+        return false;
+    }
+
+    if (!content.includes('<script')) {
+        return false;
+    }
+
+    return content.includes('<canvas')
+        || content.includes('chart.js')
+        || content.includes('plotly')
+        || content.includes('d3')
+        || content.includes('type="range"')
+        || content.includes("type='range'")
+        || content.includes('oninput=')
+        || content.includes('onclick=')
+        || content.includes('addeventlistener(');
+}
+
+function extractFirstInlineImageFromHtml(html: string): string | null {
+    const match = html.match(/<img[^>]+src=["']([^"']+)["'][^>]*>/i);
+    if (!match || !match[1]) {
+        return null;
+    }
+    return match[1];
+}
+
+function rewriteResearchCitations(
+    html: string,
+    artifactId: string,
+    sourceIndexes: Set<number>,
+    displayMap: Map<number, number>
+): string {
     const protectedSegments = html.split(/(<pre[\s\S]*?<\/pre>)/gi);
 
     return protectedSegments
@@ -201,28 +274,85 @@ function rewriteResearchCitations(html: string, artifactId: string, sourceIndexe
                 return segment;
             }
 
-            return segment.replace(/[\[【](\d+)(?:†([^\]】]+))?[\]】]/g, (_, sourceIndex: string, lineInfo?: string) => {
-                const title = lineInfo
-                    ? `Source ${sourceIndex}, ${lineInfo}`
-                    : `Source ${sourceIndex}`;
+            // Pass 1: bracket markers 【N†source】 and [N†source]
+            let result = segment.replace(/[\[【](\d+(?:[,、 ]\d+)*)(?:†([^\]】]+))?[\]】]/g, (_, rawIndexes: string, lineInfo?: string) => {
+                const indexes = splitRawIndexes(rawIndexes);
 
-                if (sourceIndexes.has(Number(sourceIndex))) {
-                    return `<sup class="bonsai-citation" title="${escapeAttribute(title)}"><a href="#artifact-${escapeAttribute(artifactId)}-source-${sourceIndex}">${escapeHtml(sourceIndex)}</a></sup>`;
-                }
+                return indexes.map((sourceIndex) => {
+                    const displayIndex = getResearchCitationDisplayNumber(sourceIndex, displayMap);
+                    const title = lineInfo
+                        ? `Source ${displayIndex}, ${lineInfo}`
+                        : `Source ${displayIndex}`;
 
-                return `<sup class="bonsai-citation" title="${escapeAttribute(title)}">${escapeHtml(sourceIndex)}</sup>`;
+                    if (sourceIndexes.has(sourceIndex)) {
+                        return `<sup class="bonsai-citation" title="${escapeAttribute(title)}"><a href="#artifact-${escapeAttribute(artifactId)}-source-${sourceIndex}">${escapeHtml(String(displayIndex))}</a></sup>`;
+                    }
+
+                    return `<sup class="bonsai-citation" title="${escapeAttribute(title)}">${escapeHtml(String(displayIndex))}</sup>`;
+                }).join(', ');
             });
+
+            // Pass 2: bare HTML citations <sup><a href="#...">N</a></sup> or <sup>N</sup>
+            // that survived without being converted to bracket markers (e.g. from probe data).
+            // Skip elements already rewritten (class="bonsai-citation") and skip <sup>
+            // elements inside source list <li data-bonsai-source-index> entries (those are
+            // source labels, not inline citations).
+            const sourcesSections = result.split(/(<section\s[^>]*data-bonsai-(?:observed-)?sources[^>]*>[\s\S]*?<\/section>)/gi);
+            result = sourcesSections.map((part, partIndex) => {
+                // Odd segments are the captured source sections — leave untouched
+                if (partIndex % 2 === 1) return part;
+
+                const withIndexedSupCitations = part.replace(
+                    /<sup\b(?![^>]*class="bonsai-citation")[^>]*\bdata-citation-index="(\d+)"[^>]*>[\s\S]*?<\/sup>/gi,
+                    (match, rawIndex: string) => {
+                        const sourceIndex = Number.parseInt(rawIndex, 10);
+                        if (!Number.isFinite(sourceIndex) || sourceIndex <= 0) return match;
+
+                        const displayIndex = getResearchCitationDisplayNumber(sourceIndex, displayMap);
+                        const title = `Source ${displayIndex}`;
+                        if (sourceIndexes.has(sourceIndex)) {
+                            return `<sup class="bonsai-citation" title="${escapeAttribute(title)}"><a href="#artifact-${escapeAttribute(artifactId)}-source-${sourceIndex}">${escapeHtml(String(displayIndex))}</a></sup>`;
+                        }
+
+                        return `<sup class="bonsai-citation" title="${escapeAttribute(title)}">${escapeHtml(String(displayIndex))}</sup>`;
+                    }
+                );
+
+                return withIndexedSupCitations.replace(
+                    /<sup(?![^>]*class="bonsai-citation")[^>]*>(?:<a\s[^>]*>)?(\d+(?:[,、 ]\d+)*)(?:<\/a>)?<\/sup>/gi,
+                    (match, rawIndexes: string) => {
+                        const numericIndexes = splitRawIndexes(rawIndexes);
+                        if (numericIndexes.length === 0) return match;
+
+                        return numericIndexes.map((sourceIndex) => {
+                            const displayIndex = getResearchCitationDisplayNumber(sourceIndex, displayMap);
+                            const title = `Source ${displayIndex}`;
+                            if (sourceIndexes.has(sourceIndex)) {
+                                return `<sup class="bonsai-citation" title="${escapeAttribute(title)}"><a href="#artifact-${escapeAttribute(artifactId)}-source-${sourceIndex}">${escapeHtml(String(displayIndex))}</a></sup>`;
+                            }
+                            return `<sup class="bonsai-citation" title="${escapeAttribute(title)}">${escapeHtml(String(displayIndex))}</sup>`;
+                        }).join(', ');
+                    }
+                );
+            }).join('');
+
+            // Add comma separators between adjacent citation pills
+            return result.replace(/<\/sup>\s*(?=<sup class="bonsai-citation")/gi, '</sup>, ');
         })
         .join('');
 }
 
 function decorateRenderedResearchHtml(artifactId: string, html: string, sourceIndexes: Set<number>): string {
+    const displayMap = buildResearchCitationDisplayMap(html);
+
     html = html.replace(
         /<(li|span)([^>]*)data-bonsai-source-index="(\d+)"([^>]*)>/g,
         (_, tagName: string, before: string, sourceIndex: string, after: string) => `<${tagName}${before}data-bonsai-source-index="${sourceIndex}"${after} id="artifact-${escapeAttribute(artifactId)}-source-${sourceIndex}">`
     );
 
-    return rewriteResearchCitations(html, artifactId, sourceIndexes);
+    html = rewriteResearchSourceDisplayNumbers(html, displayMap);
+
+    return rewriteResearchCitations(html, artifactId, sourceIndexes, displayMap);
 }
 
 function renderResearchMarkdown(artifact: ArtifactNode, markdown: string): string {
@@ -230,12 +360,33 @@ function renderResearchMarkdown(artifact: ArtifactNode, markdown: string): strin
         Array.from(markdown.matchAll(/data-bonsai-source-index="(\d+)"/g), (match) => Number(match[1]))
     );
 
+    const rawInlineIndexes = Array.from(markdown.matchAll(/[\[【](\d+(?:[,、 ]\d+)*)(?:†[^\]】]+)?[\]】]/g))
+        .flatMap((match) => splitRawIndexes(match[1]));
+
+    const rendered = decorateRenderedResearchHtml(
+        artifact.artifact_id,
+        markdownToHtml(markdown.trim()),
+        sourceIndexes
+    );
+
+    const renderedInline = Array.from(rendered.matchAll(/class="bonsai-citation"[^>]*><a href="#artifact-[^"]+-source-(\d+)">(\d+)<\/a>/g))
+        .slice(0, 16)
+        .map((match) => ({
+            sourceIndex: Number(match[1]),
+            displayIndex: Number(match[2]),
+        }));
+
+    if (rawInlineIndexes.length > 0 && sourceIndexes.size > 0) {
+        console.log('[Bonsai Citation Debug] Render markdown artifact', {
+            artifactId: artifact.artifact_id,
+            rawInlineIndexes: rawInlineIndexes.slice(0, 16),
+            sourceIndexes: Array.from(sourceIndexes).slice(0, 16),
+            renderedInline,
+        });
+    }
+
     return wrapDeepResearchHtml(
-        decorateRenderedResearchHtml(
-            artifact.artifact_id,
-            markdownToHtml(markdown.trim()),
-            sourceIndexes
-        )
+        rendered
     );
 }
 
@@ -347,7 +498,7 @@ function renderLinks(artifact: ArtifactNode): string {
     return links.length > 0 ? `<p><em>Links: ${links.join(' | ')}</em></p>` : '';
 }
 
-function renderArtifact(artifact: ArtifactNode): string {
+function renderArtifact(artifact: ArtifactNode, interactiveHtmlMode: 'render' | 'code' | 'fallback' = 'code'): string {
     let html = `<section data-artifact-id="${escapeAttribute(artifact.artifact_id)}">`;
     html += `<h3 id="artifact-${escapeAttribute(artifact.artifact_id)}" data-artifact-id="${escapeAttribute(artifact.artifact_id)}">${escapeHtml(artifact.title ?? artifact.type)}</h3>`;
     html += renderLinks(artifact);
@@ -397,6 +548,32 @@ function renderArtifact(artifact: ArtifactNode): string {
 
     if (artifact.type === 'deep_research' && artifact.mime_type === 'text/html' && typeof artifact.content === 'string') {
         html += renderResearchHtml(artifact, artifact.content);
+        html += '</section>';
+        return html;
+    }
+
+    if (looksLikeInteractiveHtmlArtifact(artifact)) {
+        if (interactiveHtmlMode === 'render') {
+            html += artifact.content as string;
+            html += '</section>';
+            return html;
+        }
+
+        if (interactiveHtmlMode === 'code') {
+            html += '<p><em>Interactive HTML artifact captured. Showing source for fidelity in sidepanel preview.</em></p>';
+            html += `<pre><code class="language-html">${escapeHtml((artifact.content as string).trim())}</code></pre>`;
+            html += '</section>';
+            return html;
+        }
+
+        const inlineImage = extractFirstInlineImageFromHtml(artifact.content as string);
+
+        html += '<p><em>Interactive HTML artifact captured. Live execution is disabled in the sidepanel preview, so a static fallback is shown.</em></p>';
+        if (inlineImage) {
+            html += `<p><img src="${escapeAttribute(inlineImage)}" alt="${escapeAttribute(artifact.title ?? 'interactive artifact snapshot')}" /></p>`;
+        }
+
+        html += '<p><em>Tip: Use Open/View link above to inspect the full interactive document.</em></p>';
         html += '</section>';
         return html;
     }
@@ -491,7 +668,8 @@ function renderMessage(
     message: MessageNode,
     artifacts: ArtifactNode[],
     providerSite: ConversationGraph['source']['provider_site'],
-    artifactMode: 'inline' | 'appendix' = 'appendix'
+    artifactMode: 'inline' | 'appendix' = 'appendix',
+    interactiveHtmlMode: 'render' | 'code' | 'fallback' = 'code'
 ): string {
     // Skip messages with no content and no artifacts to avoid empty role headers.
     if (message.content_blocks.length === 0 && artifacts.length === 0) {
@@ -514,7 +692,7 @@ function renderMessage(
     artifacts
         .filter((artifact) => !renderedArtifactIds.has(artifact.artifact_id))
         .forEach((artifact) => {
-            html += renderArtifact(artifact);
+            html += renderArtifact(artifact, interactiveHtmlMode);
         });
 
     if (message.created_at) {
@@ -527,6 +705,7 @@ function renderMessage(
 
 export function renderConversationGraphToHtml(graph: ConversationGraph, options?: RenderConversationOptions): string {
     const artifactMode = options?.artifactMode ?? 'appendix';
+    const interactiveHtmlMode = options?.interactiveHtmlMode ?? 'code';
     const remainingArtifactIds = new Set(graph.artifacts.map((artifact) => artifact.artifact_id));
     let html = `${PREVIEW_STYLES}<h1>${escapeHtml(graph.title ?? 'Conversation')}</h1>`;
 
@@ -557,14 +736,14 @@ export function renderConversationGraphToHtml(graph: ConversationGraph, options?
             ? messageArtifacts
             : messageArtifacts.filter((artifact) => !shouldRenderArtifactInAppendix(artifact, artifactMode));
         inlineArtifacts.forEach((artifact) => remainingArtifactIds.delete(artifact.artifact_id));
-        html += renderMessage(message, inlineArtifacts, graph.source.provider_site, artifactMode);
+        html += renderMessage(message, inlineArtifacts, graph.source.provider_site, artifactMode, interactiveHtmlMode);
     });
 
     const remainingArtifacts = graph.artifacts.filter((artifact) => remainingArtifactIds.has(artifact.artifact_id));
     if (remainingArtifacts.length > 0) {
         html += '<h2>Appendix</h2>';
         remainingArtifacts.forEach((artifact) => {
-            html += renderArtifact(artifact);
+            html += renderArtifact(artifact, interactiveHtmlMode);
             html += '<hr>';
         });
     }

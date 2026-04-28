@@ -94,7 +94,37 @@ describe('capture export contracts', () => {
       ],
     };
 
+    const pkg = toBonsaiImportPackage(graph);
     const markdown = exportToMarkdown(graph, { artifactMode: 'appendix' });
+
+    expect(pkg.messages[0].content).toMatchObject({
+      type: 'multimodal',
+    });
+    if (pkg.messages[0].content.type !== 'multimodal') {
+      throw new Error('expected multimodal content');
+    }
+
+    expect(pkg.messages[0].content.attachments[0]?.metadata?.content).toContain('<sup class="bonsai-citation"');
+    expect(pkg.messages[0].content.attachments[0]?.metadata?.content).toContain('id="artifact-artifact_deep_research-source-25"');
+    expect(pkg.messages[0].content.attachments[0]?.metadata?.sources).toEqual([
+      {
+        display_index: 1,
+        index: 25,
+        url: 'https://example.com/source',
+        title: 'Example Source',
+        domain: 'example.com',
+      },
+    ]);
+    expect(pkg.attachments[0]?.metadata?.content).toContain('<sup class="bonsai-citation"');
+    expect(pkg.attachments[0]?.metadata?.sources).toEqual([
+      {
+        display_index: 1,
+        index: 25,
+        url: 'https://example.com/source',
+        title: 'Example Source',
+        domain: 'example.com',
+      },
+    ]);
 
     expect(markdown).toContain('## Artifacts');
     // Index link uses a raw HTML anchor so Obsidian treats it as same-page navigation.
@@ -110,9 +140,9 @@ describe('capture export contracts', () => {
       ...sampleGraph,
       messages: sampleGraph.messages.map((message) => message.message_id === 'msg_assistant'
         ? {
-            ...message,
-            artifact_ids: [...message.artifact_ids, 'artifact_video'],
-          }
+          ...message,
+          artifact_ids: [...message.artifact_ids, 'artifact_video'],
+        }
         : message),
       artifacts: [
         ...sampleGraph.artifacts,
@@ -161,6 +191,106 @@ describe('capture export contracts', () => {
       ],
     });
     expect(markdown).toContain('<video controls src="https://video.googleusercontent.com/generated/ocean.mp4"></video>');
+  });
+
+  it('remaps deep research raw citation ids to sequential display numbers while preserving raw anchors', () => {
+    const graph: ConversationGraph = {
+      conversation_id: 'conv_deep_research_remap',
+      title: 'Deep Research Citation Remap',
+      source: {
+        provider_site: 'chatgpt.com',
+        url: 'https://chatgpt.com/c/example-remap',
+        captured_at: '2026-04-02T12:33:00.000Z',
+        capture_version: '0.1.0',
+      },
+      provenance: {
+        provider: 'openai',
+        confidence: 'observed',
+      },
+      messages: [
+        {
+          message_id: 'msg_deep_research_remap',
+          role: 'assistant',
+          sequence: 0,
+          origin: {
+            provider: 'openai',
+            confidence: 'observed',
+          },
+          content_blocks: [
+            {
+              type: 'markdown',
+              value: 'See appendix:\n\n- [Deep research report](#artifact-artifact_deep_research_remap)',
+            },
+          ],
+          artifact_ids: ['artifact_deep_research_remap'],
+          deep_link: {
+            url: 'https://chatgpt.com/c/example-remap',
+          },
+        },
+      ],
+      artifacts: [
+        {
+          artifact_id: 'artifact_deep_research_remap',
+          type: 'deep_research',
+          title: 'Deep research report',
+          mime_type: 'text/html',
+          content: '<section><p>Prioritize segment A first[25†L197-L203], then segment B[17†L10-L12].</p><section data-bonsai-sources="true"><h2>Sources</h2><ul><li data-bonsai-source-index="17"><sup>17</sup> <a href="https://example.com/b" target="_blank" rel="noreferrer">Source B</a></li><li data-bonsai-source-index="25"><sup>25</sup> <a href="https://example.com/a" target="_blank" rel="noreferrer">Source A</a></li></ul></section></section>',
+          source_message_id: 'msg_deep_research_remap',
+          exportable: true,
+        },
+      ],
+    };
+
+    const pkg = toBonsaiImportPackage(graph);
+
+    expect(pkg.messages[0].content).toMatchObject({
+      type: 'multimodal',
+    });
+    if (pkg.messages[0].content.type !== 'multimodal') {
+      throw new Error('expected multimodal content');
+    }
+
+    const attachment = pkg.messages[0].content.attachments[0];
+    expect(attachment?.metadata?.content).toContain('title="Source 1, L197-L203"');
+    expect(attachment?.metadata?.content).toContain('title="Source 2, L10-L12"');
+    expect(attachment?.metadata?.content).toContain('href="#artifact-artifact_deep_research_remap-source-25">1</a>');
+    expect(attachment?.metadata?.content).toContain('href="#artifact-artifact_deep_research_remap-source-17">2</a>');
+    expect(attachment?.metadata?.content).toContain('artifact-artifact_deep_research_remap-source-17"><sup>2</sup>');
+    expect(attachment?.metadata?.content).toContain('artifact-artifact_deep_research_remap-source-25"><sup>1</sup>');
+    expect(attachment?.metadata?.sources).toEqual([
+      {
+        index: 17,
+        display_index: 2,
+        url: 'https://example.com/b',
+        title: 'Source B',
+        domain: 'example.com',
+      },
+      {
+        index: 25,
+        display_index: 1,
+        url: 'https://example.com/a',
+        title: 'Source A',
+        domain: 'example.com',
+      },
+    ]);
+  });
+
+  it('includes source folder metadata in Bonsai import packages', () => {
+    const pkg = toBonsaiImportPackage({
+      ...sampleGraph,
+      source_folder: {
+        name: 'Alpha Project',
+        url: 'https://chatgpt.com/g/g-p-alpha/project',
+      },
+    });
+
+    expect(pkg.metadata.custom).toMatchObject({
+      capture_version: sampleGraph.source.capture_version,
+      source_folder: {
+        name: 'Alpha Project',
+        url: 'https://chatgpt.com/g/g-p-alpha/project',
+      },
+    });
   });
 
   it('wraps the rendered capture in a standalone HTML document', () => {

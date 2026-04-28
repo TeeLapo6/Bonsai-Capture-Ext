@@ -34,6 +34,7 @@ interface DeepResearchCandidate {
     html?: string;
     title?: string;
     url?: string;
+    debugRef?: string;
 }
 
 interface DeepResearchSource {
@@ -42,6 +43,11 @@ interface DeepResearchSource {
     title: string;
     url: string;
 }
+
+type ReferenceDerivedCitationIndexMap = {
+    rawToCanonical: Map<number, number>;
+    titleFallbackRawIndexes: Set<number>;
+};
 
 class ChatGPTAdapter extends BaseAdapter {
     readonly providerName = 'OpenAI';
@@ -60,6 +66,67 @@ class ChatGPTAdapter extends BaseAdapter {
             && rect.height > 0;
     }
 
+    private getDeepResearchFrames(root: Element): HTMLIFrameElement[] {
+        return Array.from(
+            root.querySelectorAll('iframe[title="internal://deep-research"], iframe[src*="deep_research"], iframe[src*="oaiusercontent.com"]')
+        ).filter((frame): frame is HTMLIFrameElement => frame instanceof HTMLIFrameElement);
+    }
+
+    private getDeepResearchEmbedRoot(frame: Element): Element {
+        const explicitRoot = frame.closest(
+            '[data-testid*="research"], [data-testid*="report"], figure, [role="article"], [class*="research"], [class*="report"]'
+        );
+        if (explicitRoot) {
+            return explicitRoot;
+        }
+
+        let current = frame.parentElement;
+        let compactRoot: Element = frame.parentElement ?? frame;
+
+        for (let depth = 0; current && depth < 3; depth += 1) {
+            if (this.getDeepResearchFrames(current).length !== 1) {
+                break;
+            }
+
+            compactRoot = current;
+            current = current.parentElement;
+        }
+
+        return compactRoot;
+    }
+
+    private getDeepResearchMessageRoot(frame: Element): Element {
+        return frame.closest(
+            '[data-message-author-role], section[data-testid^="conversation-turn"], article[data-testid^="conversation-turn"], article, section, figure, [role="article"], [class*="research"], [class*="report"]'
+        ) ?? this.getDeepResearchEmbedRoot(frame);
+    }
+
+    private hasDeepResearchEmbed(el: Element): boolean {
+        return this.getDeepResearchFrames(el).length > 0;
+    }
+
+    private findSupplementalMessageElements(root: Element, explicitRoleElements: Element[] = []): Element[] {
+        return this.getDeepResearchFrames(root)
+            .map((frame) => this.getDeepResearchMessageRoot(frame))
+            .filter((candidate, index, all) => all.indexOf(candidate) === index)
+            .filter((candidate) => !explicitRoleElements.some((roleEl) => (
+                roleEl === candidate
+                || roleEl.contains(candidate)
+                || candidate.contains(roleEl)
+            )));
+    }
+
+    private sortByDocumentOrder(elements: Element[]): Element[] {
+        return [...elements].sort((left, right) => {
+            if (left === right) return 0;
+
+            const position = left.compareDocumentPosition(right);
+            if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+            if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+            return 0;
+        });
+    }
+
     private get selectors() {
         return getSelectorsForSite(window.location.hostname) ?? getSelectorsForSite('chatgpt.com')!;
     }
@@ -76,12 +143,33 @@ class ChatGPTAdapter extends BaseAdapter {
 
         // Extract title from page or heading
         const title = this.resolveCurrentConversationTitle(isProjectPage ? 'Project Overview' : 'Untitled');
+        const projectInfo = this.getCurrentProjectInfo();
 
         return {
             url: window.location.href,
             container: container || document.body,
-            title: title || undefined
+            title: title || undefined,
+            projectName: projectInfo?.name,
+            projectUrl: projectInfo?.url,
         };
+    }
+
+    private getCurrentProjectInfo(): { name: string; url: string } | undefined {
+        const projectMatch = this.normalizePath(window.location.href).match(/(\/g\/g-p-[^/]+)(?:\/(?:c\/[a-z0-9-]+|project))?/i);
+        if (!projectMatch) return undefined;
+
+        const projectUrl = `${window.location.origin}${projectMatch[1]}/project`;
+        const projectLink = this.findProjectLinkByUrl(projectUrl);
+
+        let name = projectLink?.innerText?.trim() || projectLink?.textContent?.trim() || '';
+        name = name.split('\n')[0].trim();
+
+        if (!name) {
+            const slugMatch = projectUrl.match(/\/g\/g-p-[^/]+-([^/]+)\/project/i);
+            name = slugMatch ? slugMatch[1].replace(/-/g, ' ') : 'Unnamed Project';
+        }
+
+        return { name, url: projectUrl };
     }
 
     private extractConversationTitle(): string {
@@ -235,13 +323,23 @@ class ChatGPTAdapter extends BaseAdapter {
         const text = (el.textContent || '').trim();
 
         if (hasRoleAttr) return true;
+        if (this.hasDeepResearchEmbed(el)) return true;
         if (dataTestId.includes('chat-message') || dataTestId.includes('conversation-turn')) return true;
-        if (className.includes('chat-message') || className.includes('conversation-turn') || className.includes('group')) return true;
+        if (className.includes('chat-message') || className.includes('conversation-turn')) return true;
         if (text.length < 5) return false;
 
-        // Avoid extraneous UI sections by requiring at least one child message block or text content
-        const childMessage = el.querySelector('[data-testid*="chat-message"], [data-message-author-role], .markdown, .message-content');
+        // Prefer content-bearing descendants over generic text. This keeps
+        // wrapper turns that contain the real message bubble, but avoids
+        // treating hover controls and action rows as standalone messages.
+        const childMessage = el.querySelector(
+            '[data-testid*="chat-message"], [data-testid="message-content"], [data-message-content], ' +
+            '[data-message-author-role], .markdown, .message-content, p, pre, code, img[src], canvas, svg'
+        );
         if (childMessage) return true;
+
+        const controlCluster = el.matches('[role="toolbar"], [role="menu"]')
+            || !!el.querySelector('button, [role="button"], [role="toolbar"], [role="menu"], [aria-label], [aria-haspopup]');
+        if (controlCluster) return false;
 
         // Fallback: if it has many words and no other disqualifying attributes.
         return text.split(/\s+/).length >= 4;
@@ -286,7 +384,9 @@ class ChatGPTAdapter extends BaseAdapter {
 
         // Remove nested elements (keep top-level message turns).
         const unique = Array.from(new Set(filtered));
-        return unique.filter(el => !unique.some(parent => parent !== el && parent.contains(el)));
+        return this.sortByDocumentOrder(
+            unique.filter(el => !unique.some(parent => parent !== el && parent.contains(el)))
+        );
     }
 
     listMessages(): Element[] {
@@ -294,11 +394,26 @@ class ChatGPTAdapter extends BaseAdapter {
         if (!conversation) return [];
 
         const explicitRoleElements = Array.from(conversation.container.querySelectorAll('[data-message-author-role]'));
+        const supplementalElements = this.findSupplementalMessageElements(conversation.container, explicitRoleElements);
 
-        let elements = this.normalizeMessageElements([
-            ...queryAllWithFallbacks(conversation.container, this.selectors.messageBlock),
-            ...explicitRoleElements,
-        ]);
+        // Prefer explicit ChatGPT message bubbles when available. Broad selector
+        // fallbacks can also match hover-control rows and auxiliary UI, which
+        // leads to duplicate button injection and inflated message counts.
+        // Merge back only known supplemental non-role turns such as deep research
+        // cards so they still get buttons and inline artifact anchors.
+        if (explicitRoleElements.length > 0) {
+            return this.normalizeMessageElements([
+                ...explicitRoleElements,
+                ...supplementalElements,
+            ]);
+        }
+
+        let elements = this.normalizeMessageElements(
+            [
+                ...queryAllWithFallbacks(conversation.container, this.selectors.messageBlock),
+                ...supplementalElements,
+            ]
+        );
 
         if (elements.length === 0) {
             const directSections = Array.from(conversation.container.querySelectorAll(':scope > section'))
@@ -315,7 +430,7 @@ class ChatGPTAdapter extends BaseAdapter {
         }
 
         if (elements.length === 0) {
-            elements = this.normalizeMessageElements(Array.from(conversation.container.querySelectorAll('[data-testid*="chat-message"], .chat-message, .message, .group, div[role="listitem"]')));
+            elements = this.normalizeMessageElements(Array.from(conversation.container.querySelectorAll('[data-testid*="chat-message"], .chat-message, .message, div[role="listitem"]')));
         }
 
         return elements;
@@ -361,9 +476,7 @@ class ChatGPTAdapter extends BaseAdapter {
         sourceUrl?: string;
         viewUrl?: string;
     }> {
-        const frames = Array.from(
-            el.querySelectorAll('iframe[title="internal://deep-research"], iframe[src*="deep_research"], iframe[src*="oaiusercontent.com"]')
-        );
+        const frames = this.getDeepResearchFrames(el);
         const seen = new Set<string>();
         const embeds: Array<{
             title: string;
@@ -374,9 +487,7 @@ class ChatGPTAdapter extends BaseAdapter {
 
         for (const frameEl of frames) {
             const frame = frameEl as HTMLIFrameElement;
-            const cardRoot = frame.closest(
-                '[data-testid*="research"], [data-testid*="report"], article, section, figure, [role="article"], [class*="research"], [class*="report"]'
-            ) ?? frame.parentElement ?? frame;
+            const cardRoot = this.getDeepResearchEmbedRoot(frame);
 
             const { viewUrl: extractedViewUrl, sourceUrl: extractedSourceUrl } = this.extractArtifactLinks(cardRoot);
 
@@ -410,7 +521,7 @@ class ChatGPTAdapter extends BaseAdapter {
 
             let title = cardRoot.querySelector('h1, h2, h3, h4, [role="heading"], strong')
                 ?.textContent
-                ?.trim() || document.title.replace(/\s*-\s*ChatGPT.*$/i, '').trim() || 'Deep research report';
+                ?.trim() || 'Deep research report';
             title = this.cleanArtifactText(title);
             if (!title || /^(chatgpt\s+said|open|artifact|report)$/i.test(title)) {
                 title = 'Deep research report';
@@ -446,6 +557,34 @@ class ChatGPTAdapter extends BaseAdapter {
         return embeds;
     }
 
+    private isChatGPTShellContent(content: string): boolean {
+        const normalized = this.cleanArtifactText(
+            content.trimStart().startsWith('<')
+                ? content.replace(/<[^>]+>/g, ' ')
+                : content
+        )
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+
+        if (!normalized) {
+            return false;
+        }
+
+        const shellSignals = [
+            'skip to content',
+            'chat history',
+            'new chat',
+            'search chats',
+            'codex',
+            'explore gpts',
+            'chatgpt can make mistakes',
+        ];
+
+        const matchedSignals = shellSignals.filter((signal) => normalized.includes(signal)).length;
+        return matchedSignals >= 3 && normalized.includes('chat history');
+    }
+
     private hasMeaningfulArtifactContent(content: string, title?: string): boolean {
         if (!content) {
             return false;
@@ -462,6 +601,10 @@ class ChatGPTAdapter extends BaseAdapter {
         );
 
         if (!normalized || this.isNoiseOnlyArtifactText(normalized)) {
+            return false;
+        }
+
+        if (this.isChatGPTShellContent(content)) {
             return false;
         }
 
@@ -557,6 +700,13 @@ class ChatGPTAdapter extends BaseAdapter {
             return Number(value.trim());
         }
 
+        if (typeof value === 'string') {
+            const citationMatch = value.match(/[\[【]?(\d{1,3})(?=†|[\]】,\s]|$)/);
+            if (citationMatch) {
+                return Number(citationMatch[1]);
+            }
+        }
+
         return undefined;
     }
 
@@ -591,10 +741,12 @@ class ChatGPTAdapter extends BaseAdapter {
         }
     }
 
-    private canonicalizeResearchUrl(rawUrl: string): string | null {
+    private canonicalizeResearchUrl(rawUrl: string, options?: { stripHash?: boolean }): string | null {
         try {
             const url = new URL(rawUrl, window.location.href);
-            url.hash = '';
+            if (options?.stripHash !== false) {
+                url.hash = '';
+            }
 
             const trackingParams = [
                 'utm_source',
@@ -648,6 +800,15 @@ class ChatGPTAdapter extends BaseAdapter {
         return score;
     }
 
+    private shouldPreserveResearchUrlHash(rawUrl: string): boolean {
+        try {
+            const url = new URL(rawUrl, window.location.href);
+            return url.hash.startsWith('#:~:text=');
+        } catch {
+            return false;
+        }
+    }
+
     private normalizeDeepResearchSource(candidate: {
         index?: unknown;
         title?: string;
@@ -658,7 +819,9 @@ class ChatGPTAdapter extends BaseAdapter {
         }
 
         try {
-            const resolvedUrl = this.canonicalizeResearchUrl(candidate.url);
+            const resolvedUrl = this.canonicalizeResearchUrl(candidate.url, {
+                stripHash: false,
+            });
             if (!resolvedUrl) {
                 return null;
             }
@@ -700,13 +863,14 @@ class ChatGPTAdapter extends BaseAdapter {
                 return normalized ? [normalized] : [];
             })
             .forEach((candidate) => {
+                const titleKey = this.normalizeDeepResearchSourceTitle(candidate.title).toLowerCase();
+                const key = `${candidate.url}|${titleKey}`;
+
                 if (candidate.index !== undefined) {
                     indexed.set(candidate.index, chooseBetterSource(indexed.get(candidate.index), candidate));
                     return;
                 }
 
-                const titleKey = this.normalizeDeepResearchSourceTitle(candidate.title).toLowerCase();
-                const key = `${candidate.url}|${titleKey}`;
                 unindexed.set(key, chooseBetterSource(unindexed.get(key), candidate));
             });
 
@@ -724,11 +888,22 @@ class ChatGPTAdapter extends BaseAdapter {
 
     private extractCitationIndices(content: string): number[] {
         const seen = new Set<number>();
+        const segments = content.split(/(<section\s[^>]*data-bonsai-(?:observed-)?sources[^>]*>[\s\S]*?<\/section>)/gi);
+        const contentHtml = segments.filter((_part, idx) => idx % 2 === 0).join('\n');
 
-        for (const match of content.matchAll(/[\[【](\d+)(?:†[^\]】]+)?[\]】]/g)) {
-            const value = Number(match[1]);
-            if (Number.isFinite(value) && value > 0) {
-                seen.add(value);
+        const combinedPattern = /(?:[\[【](\d+(?:[,、 ]\d+)*)(?:†[^\]】]+)?[\]】])|(?:data-citation-index="(\d+)")|(?:<sup(?![^>]*class="bonsai-citation")[^>]*>(?:<a\s[^>]*>)?(\d+(?:[,、 ]\d+)*)(?:<\/a>)?<\/sup>)/gi;
+
+        for (const match of contentHtml.matchAll(combinedPattern)) {
+            const rawIndexes = match[1] || match[2] || match[3];
+            if (!rawIndexes) {
+                continue;
+            }
+
+            for (const raw of rawIndexes.split(/[,、 ]+/)) {
+                const value = Number(raw.trim());
+                if (Number.isFinite(value) && value > 0) {
+                    seen.add(value);
+                }
             }
         }
 
@@ -785,6 +960,27 @@ class ChatGPTAdapter extends BaseAdapter {
             const parsed = new DOMParser().parseFromString(rawHtml, 'text/html');
             const candidates: Array<{ index?: unknown; title?: string; url?: string }> = [];
 
+            parsed.querySelectorAll('button[data-citation-index][aria-label^="Scroll report to citation "]').forEach((button) => {
+                const rawHref = button.parentElement?.querySelector('a[href]')?.getAttribute('href');
+                const titleText = button.parentElement?.querySelector('a[href]')?.textContent ?? '';
+                if (!rawHref) {
+                    return;
+                }
+
+                let resolvedHref = rawHref;
+                try {
+                    resolvedHref = new URL(rawHref, baseUrl).href;
+                } catch {
+                    // Keep original href if URL resolution fails.
+                }
+
+                candidates.push({
+                    index: button.getAttribute('data-citation-index') ?? undefined,
+                    title: this.cleanArtifactText(titleText),
+                    url: resolvedHref,
+                });
+            });
+
             parsed.querySelectorAll('a[href]').forEach((anchor) => {
                 const rawHref = anchor.getAttribute('href');
                 if (!rawHref) {
@@ -798,12 +994,33 @@ class ChatGPTAdapter extends BaseAdapter {
                     // Keep original href if URL resolution fails.
                 }
 
-                const containerText = anchor.closest('li, p, div, tr')?.textContent ?? anchor.textContent ?? '';
-                const indexMatch = containerText.match(/^\s*(\d{1,3})\b/);
+                const liWrapper = anchor.closest('li');
+                let indexToUse: number | undefined;
+
+                const explicitIndex = liWrapper?.getAttribute('data-citation-index');
+                if (explicitIndex) {
+                    indexToUse = Number(explicitIndex);
+                } else if (liWrapper && liWrapper.parentElement?.tagName === 'OL') {
+                    const siblings = Array.from(liWrapper.parentElement.children).filter(child => child.tagName === 'LI');
+                    const position = siblings.indexOf(liWrapper);
+                    if (position !== -1) {
+                        const startObj = liWrapper.parentElement.getAttribute('start');
+                        const start = startObj ? Number(startObj) : 1;
+                        indexToUse = start + position;
+                    }
+                }
+
+                if (indexToUse === undefined) {
+                    const containerText = liWrapper?.textContent ?? anchor.textContent ?? '';
+                    const match = containerText.match(/^\s*(\d{1,3})\b/);
+                    if (match) {
+                        indexToUse = Number(match[1]);
+                    }
+                }
 
                 candidates.push({
-                    index: indexMatch?.[1],
-                    title: this.cleanArtifactText(anchor.textContent ?? containerText ?? ''),
+                    index: indexToUse,
+                    title: this.cleanArtifactText(anchor.textContent ?? liWrapper?.textContent ?? ''),
                     url: resolvedHref,
                 });
             });
@@ -820,7 +1037,7 @@ class ChatGPTAdapter extends BaseAdapter {
             const candidates: Array<{ index?: unknown; title?: string; url?: string }> = [];
             const seenObjects = new WeakSet<object>();
 
-            const visit = (value: unknown, depth = 0) => {
+            const visit = (value: unknown, depth = 0, injectedIndex?: string) => {
                 if (depth > 6 || value == null) {
                     return;
                 }
@@ -831,7 +1048,7 @@ class ChatGPTAdapter extends BaseAdapter {
                 }
 
                 if (Array.isArray(value)) {
-                    value.slice(0, 50).forEach((item) => visit(item, depth + 1));
+                    value.slice(0, 50).forEach((item, arrIdx) => visit(item, depth + 1, String(arrIdx + 1)));
                     return;
                 }
 
@@ -845,6 +1062,27 @@ class ChatGPTAdapter extends BaseAdapter {
                 seenObjects.add(value as object);
 
                 const record = value as Record<string, unknown>;
+
+                // Note: content_references uses an internal bucket-numbering
+                // scheme (13 unique values) that does NOT match the display
+                // citation numbers (1..N).  Skip it here; the canonical source
+                // list is extracted upstream by extractSourcesFromWidgetStateCitations.
+
+                if (Array.isArray(record.references)) {
+                    record.references.slice(0, 200).forEach((reference) => {
+                        if (!reference || typeof reference !== 'object') {
+                            return;
+                        }
+
+                        const refRecord = reference as Record<string, unknown>;
+                        candidates.push({
+                            index: refRecord.index ?? refRecord.matched_text ?? refRecord.matchedText,
+                            title: typeof refRecord.title === 'string' ? refRecord.title : undefined,
+                            url: typeof refRecord.url === 'string' ? refRecord.url : undefined,
+                        });
+                    });
+                }
+
                 const explicitUrl = ['url', 'href', 'link', 'uri', 'sourceUrl', 'source_url']
                     .map((key) => record[key])
                     .find((candidate): candidate is string => typeof candidate === 'string' && candidate.trim().length > 0);
@@ -853,12 +1091,12 @@ class ChatGPTAdapter extends BaseAdapter {
                     .find((candidate): candidate is string => typeof candidate === 'string' && candidate.trim().length > 0);
                 const candidateUrl = explicitUrl
                     ?? (domain && /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(domain.trim()) ? `https://${domain.trim()}` : undefined);
-                const title = ['title', 'name', 'label', 'sourceTitle', 'domain', 'hostname']
+                const title = ['title', 'name', 'label', 'sourceTitle', 'domain', 'hostname', 'siteName', 'site']
                     .map((key) => record[key])
                     .find((candidate): candidate is string => typeof candidate === 'string' && candidate.trim().length > 0);
-                const index = ['index', 'sourceIndex', 'citationIndex', 'number', 'source_id', 'sourceId', 'id']
+                const index = ['index', 'sourceIndex', 'citationIndex', 'number', 'source_id', 'sourceId', 'matched_text', 'matchedText', 'id']
                     .map((key) => record[key])
-                    .find((candidate) => candidate !== undefined);
+                    .find((candidate) => candidate !== undefined) ?? injectedIndex;
 
                 if (candidateUrl) {
                     candidates.push({
@@ -868,9 +1106,12 @@ class ChatGPTAdapter extends BaseAdapter {
                     });
                 }
 
-                Object.values(record)
+                Object.entries(record)
                     .slice(0, 60)
-                    .forEach((nested) => visit(nested, depth + 1));
+                    .forEach(([key, nested]) => {
+                        const nextInjectedIndex = /^\d+$/.test(key.trim()) ? key.trim() : undefined;
+                        visit(nested, depth + 1, nextInjectedIndex);
+                    });
             };
 
             visit(parsed);
@@ -880,16 +1121,129 @@ class ChatGPTAdapter extends BaseAdapter {
         }
     }
 
+    /**
+     * Extracts the canonical 1-indexed source list from the deep research widget-state
+     * message-port probe entry.  OpenAI sends a CALL payload containing
+     * `widgetState.report_message.metadata.citations` – a flat array of every
+     * inline citation (including duplicates).  Deduplicating by URL in
+     * first-appearance order reproduces exactly the numbered Sources panel
+     * shown in the iframe (34 items for a 34-source report, etc.).
+     */
+    private async extractSourcesFromWidgetStateCitations(): Promise<DeepResearchSource[]> {
+        const snapshots = await this.getOpenAIProbeSnapshots();
+        console.log(`[Bonsai Citation Debug] v3 extractSourcesFromWidgetStateCitations: ${snapshots.length} snapshots`, snapshots.map(s => ({ url: s.url.slice(0, 80), entries: s.entries.length, kinds: s.entries.map(e => e.kind) })));
+        for (const snapshot of snapshots) {
+            for (const entry of snapshot.entries) {
+                if (entry.kind !== 'message-port') {
+                    continue;
+                }
+
+                try {
+                    const parsed: unknown = JSON.parse(entry.body);
+                    const payload = Array.isArray(parsed) ? parsed[1] : parsed;
+                    if (!payload || typeof payload !== 'object') {
+                        console.log('[Bonsai Citation Debug] message-port entry has non-object payload after parse', typeof payload);
+                        continue;
+                    }
+
+                    const ws = (payload as Record<string, unknown>).widgetState;
+                    if (!ws || typeof ws !== 'object') {
+                        console.log('[Bonsai Citation Debug] message-port payload missing widgetState, keys:', Object.keys(payload as object).slice(0, 6));
+                        continue;
+                    }
+
+                    const reportMsg = (ws as Record<string, unknown>).report_message;
+                    if (!reportMsg || typeof reportMsg !== 'object') {
+                        continue;
+                    }
+
+                    const metadata = (reportMsg as Record<string, unknown>).metadata;
+                    if (!metadata || typeof metadata !== 'object') {
+                        continue;
+                    }
+
+                    const citations = (metadata as Record<string, unknown>).citations;
+                    if (!Array.isArray(citations) || citations.length === 0) {
+                        continue;
+                    }
+
+                    // Deduplicate by full URL, preserving first-appearance order.
+                    // Each unique URL becomes source index 1, 2, 3 … matching the
+                    // numbered Sources panel rendered by the deep-research iframe.
+                    const seen = new Set<string>();
+                    const sources: DeepResearchSource[] = [];
+
+                    for (const citation of citations) {
+                        if (!citation || typeof citation !== 'object') {
+                            continue;
+                        }
+
+                        const meta = (citation as Record<string, unknown>).metadata;
+                        if (!meta || typeof meta !== 'object') {
+                            continue;
+                        }
+
+                        const url = (meta as Record<string, unknown>).url;
+                        const title = (meta as Record<string, unknown>).title;
+
+                        if (typeof url !== 'string' || !url) {
+                            continue;
+                        }
+
+                        if (seen.has(url)) {
+                            continue;
+                        }
+
+                        seen.add(url);
+                        const cleanTitle = this.cleanArtifactText(typeof title === 'string' ? title : '');
+                        const resolvedTitle = cleanTitle || (() => {
+                            try {
+                                return new URL(url).hostname.replace(/^www\./i, '');
+                            } catch {
+                                return '';
+                            }
+                        })();
+                        sources.push({
+                            index: sources.length + 1,
+                            title: resolvedTitle,
+                            url,
+                        });
+                    }
+
+                    if (sources.length >= 3) {
+                        console.log(`[Bonsai Citation Debug] widgetState citations fast-path: ${sources.length} sources found`);
+                        return sources;
+                    }
+                } catch {
+                    // continue to next entry
+                }
+            }
+        }
+
+        console.log('[Bonsai Citation Debug] widgetState citations fast-path: no usable entry found, falling back');
+        return [];
+    }
+
     private async collectSourcesForEmbed(
         embed: { title: string; sourceUrl?: string; viewUrl?: string },
         preferredCandidate?: { html?: string; text: string; url?: string }
     ): Promise<DeepResearchSource[]> {
+        // Fast path: the probe captures a message-port payload containing the
+        // canonical citation array from the deep-research widget state.
+        // Deduplicating by URL gives the exact numbered source list (1..N)
+        // that matches the Sources panel rendered by the iframe.
+        const widgetCitations = await this.extractSourcesFromWidgetStateCitations();
+        if (widgetCitations.length >= 3) {
+            return widgetCitations;
+        }
+
         const candidates: Array<{ index?: unknown; title?: string; url?: string }> = [];
         const pushAll = (sources: DeepResearchSource[]) => {
             candidates.push(...sources);
         };
         const baseUrl = preferredCandidate?.url ?? embed.viewUrl ?? embed.sourceUrl ?? window.location.href;
         const preferredSources: DeepResearchSource[] = [];
+        const preferredCitationIndexes = this.extractCitationIndices(preferredCandidate?.html ?? preferredCandidate?.text ?? '');
 
         if (preferredCandidate?.html) {
             preferredSources.push(...this.extractSourceCandidatesFromHtml(preferredCandidate.html, baseUrl));
@@ -906,8 +1260,8 @@ class ChatGPTAdapter extends BaseAdapter {
             return preferredIndexedSources;
         }
 
-        if (dedupedPreferredSources.length >= 3) {
-            return dedupedPreferredSources.slice(0, 24);
+        if (dedupedPreferredSources.length >= 3 && preferredCitationIndexes.length === 0) {
+            return dedupedPreferredSources.slice(0, 99);
         }
 
         pushAll(dedupedPreferredSources);
@@ -968,7 +1322,9 @@ class ChatGPTAdapter extends BaseAdapter {
             }
         }
 
-        return this.dedupeDeepResearchSources(candidates).slice(0, 24);
+        const dedupedSources = this.dedupeDeepResearchSources(candidates);
+        const indexedSources = dedupedSources.filter((source): source is DeepResearchSource & { index: number } => source.index !== undefined);
+        return (indexedSources.length > 0 ? indexedSources : dedupedSources).slice(0, 99);
     }
 
     private buildSourcesSectionHtml(title: string, sources: DeepResearchSource[], indexed: boolean): string {
@@ -981,12 +1337,18 @@ class ChatGPTAdapter extends BaseAdapter {
                     const indexes = (source.aliases && source.aliases.length > 0)
                         ? source.aliases
                         : [source.index!];
-                    const markers = indexes
+
+                    // Primary index goes directly on the <li> so TipTap's listItem node
+                    // preserves the id attribute added by decorateRenderedResearchHtml.
+                    // Any additional alias indexes get <span data-bonsai-source-index>
+                    // markers inside the <li> for secondary anchor targets.
+                    const [primaryIndex, ...aliasIndexes] = indexes;
+                    const aliasMarkers = aliasIndexes
                         .map((index) => `<span data-bonsai-source-index="${index}"></span>`)
                         .join('');
                     const label = indexes.join(', ');
 
-                    return `  <li>${markers}<sup>${this.escapeHtml(label)}</sup> <a href="${escapedUrl}" target="_blank" rel="noreferrer">${escapedTitle}</a></li>`;
+                    return `  <li data-bonsai-source-index="${primaryIndex}">${aliasMarkers}<sup>${this.escapeHtml(label)}</sup> <a href="${escapedUrl}" target="_blank" rel="noreferrer">${escapedTitle}</a></li>`;
                 }
 
                 return `  <li><a href="${escapedUrl}" target="_blank" rel="noreferrer">${escapedTitle}</a></li>`;
@@ -996,13 +1358,381 @@ class ChatGPTAdapter extends BaseAdapter {
         return `<section ${indexed ? 'data-bonsai-sources="true"' : 'data-bonsai-observed-sources="true"'}>\n<h2>${title}</h2>\n<ul>\n${items}\n</ul>\n</section>`;
     }
 
+    private buildReferenceDerivedCitationIndexMap(
+        metadata: Record<string, unknown>,
+        canonicalSources: Array<DeepResearchSource & { index: number }>
+    ): ReferenceDerivedCitationIndexMap {
+        const exactCanonicalByUrl = new Map<string, number>();
+        const normalizedCanonicalByUrl = new Map<string, number>();
+        const normalizedCanonicalUrlCounts = new Map<string, number>();
+        const titleCounts = new Map<string, number>();
+
+        canonicalSources.forEach((source) => {
+            const exactUrl = this.canonicalizeResearchUrl(source.url, { stripHash: false }) ?? source.url;
+            exactCanonicalByUrl.set(exactUrl, source.index);
+
+            const normalizedUrl = this.canonicalizeResearchUrl(source.url);
+            if (normalizedUrl) {
+                normalizedCanonicalByUrl.set(normalizedUrl, source.index);
+                normalizedCanonicalUrlCounts.set(normalizedUrl, (normalizedCanonicalUrlCounts.get(normalizedUrl) ?? 0) + 1);
+            }
+
+            const titleKey = this.normalizeDeepResearchSourceTitle(source.title).toLowerCase();
+            titleCounts.set(titleKey, (titleCounts.get(titleKey) ?? 0) + 1);
+        });
+
+        const canonicalByUniqueTitle = new Map<string, number>();
+        canonicalSources.forEach((source) => {
+            const titleKey = this.normalizeDeepResearchSourceTitle(source.title).toLowerCase();
+            if ((titleCounts.get(titleKey) ?? 0) === 1) {
+                canonicalByUniqueTitle.set(titleKey, source.index);
+            }
+        });
+
+        const resolveCanonicalIndex = (candidate: { rawUrl?: string; normalizedUrl?: string; title?: string }): number | undefined => {
+            const titleKey = this.normalizeDeepResearchSourceTitle(candidate.title ?? '').toLowerCase();
+            const exactMatch = candidate.rawUrl ? exactCanonicalByUrl.get(candidate.rawUrl) : undefined;
+            if (exactMatch !== undefined) {
+                return exactMatch;
+            }
+
+            if (candidate.normalizedUrl && (normalizedCanonicalUrlCounts.get(candidate.normalizedUrl) ?? 0) === 1) {
+                const normalizedMatch = normalizedCanonicalByUrl.get(candidate.normalizedUrl);
+                if (normalizedMatch !== undefined) {
+                    return normalizedMatch;
+                }
+            }
+
+            return canonicalByUniqueTitle.get(titleKey);
+        };
+
+        const rawToCanonical = new Map<number, number>();
+        const titleFallbackRawIndexes = new Set<number>();
+        const maybeReferenceArrays = [
+            metadata.content_references,
+            metadata.contentReferences,
+            metadata.references,
+            metadata.reference_list,
+            metadata.referenceList,
+        ];
+
+        maybeReferenceArrays.forEach((value) => {
+            if (!Array.isArray(value)) {
+                return;
+            }
+
+            value.slice(0, 500).forEach((entry) => {
+                if (!entry || typeof entry !== 'object') {
+                    return;
+                }
+
+                const record = entry as Record<string, unknown>;
+                const nestedMeta = record.metadata && typeof record.metadata === 'object'
+                    ? record.metadata as Record<string, unknown>
+                    : undefined;
+
+                const rawIndex = this.normalizeSourceIndex(
+                    record.index
+                    ?? record.sourceIndex
+                    ?? record.citationIndex
+                    ?? record.number
+                    ?? record.source_id
+                    ?? record.sourceId
+                    ?? record.id
+                    ?? record.matched_text
+                    ?? record.matchedText
+                );
+                if (rawIndex === undefined) {
+                    return;
+                }
+
+                const rawTitle = typeof record.title === 'string'
+                    ? record.title
+                    : typeof record.name === 'string'
+                        ? record.name
+                        : typeof nestedMeta?.title === 'string'
+                            ? nestedMeta.title
+                            : undefined;
+                const rawUrl = typeof record.url === 'string'
+                    ? record.url
+                    : typeof record.href === 'string'
+                        ? record.href
+                        : typeof nestedMeta?.url === 'string'
+                            ? nestedMeta.url
+                            : typeof nestedMeta?.href === 'string'
+                                ? nestedMeta.href
+                                : undefined;
+
+                const exactUrl = rawUrl && this.isExternalResearchUrl(rawUrl)
+                    ? this.canonicalizeResearchUrl(rawUrl, { stripHash: false }) ?? undefined
+                    : undefined;
+                const normalizedUrl = rawUrl && this.isExternalResearchUrl(rawUrl)
+                    ? this.canonicalizeResearchUrl(rawUrl) ?? undefined
+                    : undefined;
+
+                const matchedByUrl = exactUrl !== undefined || normalizedUrl !== undefined;
+                const canonical = resolveCanonicalIndex({
+                    rawUrl: exactUrl,
+                    normalizedUrl,
+                    title: rawTitle,
+                });
+                if (canonical !== undefined) {
+                    rawToCanonical.set(rawIndex, canonical);
+                    if (!matchedByUrl) {
+                        titleFallbackRawIndexes.add(rawIndex);
+                    }
+                }
+            });
+        });
+
+        return { rawToCanonical, titleFallbackRawIndexes };
+    }
+
+    private async buildCanonicalCitationIndexMap(
+        sources: DeepResearchSource[],
+        preferredDebugRef?: string,
+        citedRawIndexes: number[] = []
+    ): Promise<Map<number, number>> {
+        const canonicalSources = sources.filter((source): source is DeepResearchSource & { index: number } => source.index !== undefined);
+        if (canonicalSources.length === 0) {
+            return new Map();
+        }
+
+        // Build URL → canonical index lookup from the already-deduplicated sources list.
+        const urlToCanonical = new Map<string, number>();
+        const normalizedUrlToCanonical = new Map<string, number>();
+        const normalizedUrlCounts = new Map<string, number>();
+
+        for (const source of canonicalSources) {
+            urlToCanonical.set(source.url, source.index);
+
+            const normalizedSourceUrl = this.canonicalizeResearchUrl(source.url);
+            if (normalizedSourceUrl) {
+                normalizedUrlToCanonical.set(normalizedSourceUrl, source.index);
+                normalizedUrlCounts.set(normalizedSourceUrl, (normalizedUrlCounts.get(normalizedSourceUrl) ?? 0) + 1);
+            }
+        }
+
+        const resolveCitationUrlToCanonical = (rawUrl: string): number | undefined => {
+            const exactUrl = this.canonicalizeResearchUrl(rawUrl, { stripHash: false });
+            if (exactUrl) {
+                const exactMatch = urlToCanonical.get(exactUrl);
+                if (exactMatch !== undefined) {
+                    return exactMatch;
+                }
+            }
+
+            const normalizedUrl = this.canonicalizeResearchUrl(rawUrl);
+            if (normalizedUrl && (normalizedUrlCounts.get(normalizedUrl) ?? 0) === 1) {
+                return normalizedUrlToCanonical.get(normalizedUrl);
+            }
+
+            return undefined;
+        };
+
+        const snapshots = await this.getOpenAIProbeSnapshots();
+        let firstFullCoverage: { debugRef: string; map: Map<number, number> } | null = null;
+        let preferredCoverage = 0;
+
+        // Walk metadata.citations in position order (same structure as
+        // extractSourcesFromWidgetStateCitations).  rawIndex = position + 1 (1-based)
+        // matches the inline marker number 【N†…】 in the probe markdown.
+        for (let snapshotIndex = 0; snapshotIndex < snapshots.length; snapshotIndex += 1) {
+            const snapshot = snapshots[snapshotIndex];
+            for (let entryIndex = 0; entryIndex < snapshot.entries.length; entryIndex += 1) {
+                const entry = snapshot.entries[entryIndex];
+                if (entry.kind !== 'message-port') {
+                    continue;
+                }
+
+                const entryDebugRef = this.buildProbeEntryDebugRef(snapshotIndex, entryIndex, entry.kind, entry.url || snapshot.url);
+                const positionDerivedMap = new Map<number, number>();
+
+                try {
+                    const parsed: unknown = JSON.parse(entry.body);
+                    const payload = Array.isArray(parsed) ? parsed[1] : parsed;
+                    if (!payload || typeof payload !== 'object') {
+                        continue;
+                    }
+
+                    const ws = (payload as Record<string, unknown>).widgetState;
+                    if (!ws || typeof ws !== 'object') {
+                        continue;
+                    }
+
+                    const reportMsg = (ws as Record<string, unknown>).report_message;
+                    if (!reportMsg || typeof reportMsg !== 'object') {
+                        continue;
+                    }
+
+                    const metadata = (reportMsg as Record<string, unknown>).metadata;
+                    if (!metadata || typeof metadata !== 'object') {
+                        continue;
+                    }
+
+                    const citations = (metadata as Record<string, unknown>).citations;
+                    if (!Array.isArray(citations) || citations.length === 0) {
+                        continue;
+                    }
+
+                    for (let i = 0; i < citations.length; i += 1) {
+                        const rawIndex = i + 1;
+                        const citation = citations[i];
+                        if (!citation || typeof citation !== 'object') {
+                            continue;
+                        }
+
+                        const citMeta = (citation as Record<string, unknown>).metadata;
+                        if (!citMeta || typeof citMeta !== 'object') {
+                            continue;
+                        }
+
+                        const url = (citMeta as Record<string, unknown>).url;
+                        if (typeof url !== 'string' || !url) {
+                            continue;
+                        }
+
+                        const canonical = resolveCitationUrlToCanonical(url);
+                        if (canonical !== undefined) {
+                            positionDerivedMap.set(rawIndex, canonical);
+                        }
+                    }
+
+                    const {
+                        rawToCanonical: referenceDerivedMap,
+                        titleFallbackRawIndexes,
+                    } = this.buildReferenceDerivedCitationIndexMap(metadata as Record<string, unknown>, canonicalSources);
+                    const mergedMap = new Map(positionDerivedMap);
+                    referenceDerivedMap.forEach((canonical, rawIndex) => {
+                        if (titleFallbackRawIndexes.has(rawIndex) && mergedMap.has(rawIndex)) {
+                            return;
+                        }
+                        mergedMap.set(rawIndex, canonical);
+                    });
+
+                    const citedRawSet = new Set(citedRawIndexes);
+                    const referenceCoverage = citedRawSet.size > 0
+                        ? citedRawIndexes.filter((rawIndex) => referenceDerivedMap.has(rawIndex)).length
+                        : referenceDerivedMap.size;
+                    const positionCoverage = citedRawSet.size > 0
+                        ? citedRawIndexes.filter((rawIndex) => positionDerivedMap.has(rawIndex)).length
+                        : positionDerivedMap.size;
+                    const mergedCoverage = citedRawSet.size > 0
+                        ? citedRawIndexes.filter((rawIndex) => mergedMap.has(rawIndex)).length
+                        : mergedMap.size;
+                    const canonicalCoverage = new Set(mergedMap.values()).size;
+
+                    const isPreferred = Boolean(preferredDebugRef) && entryDebugRef === preferredDebugRef;
+                    const isFullCoverage = citedRawSet.size > 0
+                        ? mergedCoverage === citedRawSet.size
+                        : canonicalCoverage >= canonicalSources.length;
+
+                    if (isPreferred) {
+                        preferredCoverage = mergedCoverage;
+                        if (isFullCoverage) {
+                            console.log('[Bonsai Citation Debug] Canonical citation map entry selected (preferred exact match)', {
+                                preferredDebugRef,
+                                chosenDebugRef: entryDebugRef,
+                                coverage: mergedCoverage,
+                                canonicalCoverage,
+                                canonicalSourceCount: canonicalSources.length,
+                                sampleMap: Array.from(mergedMap.entries()).slice(0, 12),
+                                referenceCoverage,
+                                positionCoverage,
+                                mergedCoverage,
+                                sampleReferenceMap: Array.from(referenceDerivedMap.entries()).slice(0, 12),
+                            });
+                            return mergedMap;
+                        }
+                    }
+
+                    if (isFullCoverage && !firstFullCoverage) {
+                        firstFullCoverage = {
+                            debugRef: entryDebugRef,
+                            map: new Map(mergedMap),
+                        };
+                    }
+                } catch {
+                    // continue to next entry
+                }
+            }
+        }
+
+        if (firstFullCoverage) {
+            console.log('[Bonsai Citation Debug] Canonical citation map entry selected (full-coverage fallback)', {
+                preferredDebugRef: preferredDebugRef ?? null,
+                chosenDebugRef: firstFullCoverage.debugRef,
+                preferredCoverage,
+                canonicalSourceCount: canonicalSources.length,
+                sampleMap: Array.from(firstFullCoverage.map.entries()).slice(0, 12),
+            });
+            return firstFullCoverage.map;
+        }
+
+        console.log('[Bonsai Citation Debug] Canonical citation map entry not found', {
+            preferredDebugRef: preferredDebugRef ?? null,
+            preferredCoverage,
+            canonicalSourceCount: canonicalSources.length,
+        });
+        return new Map();
+    }
+
+    private rewriteCitationMarkersToCanonicalIndexes(text: string, rawToCanonical: Map<number, number>): string {
+        if (!text || rawToCanonical.size === 0) {
+            return text;
+        }
+
+        return text.replace(
+            /([\[【])(\d+(?:[,、 ]\d+)*)(†[^\]】]+)?([\]】])/g,
+            (_match, open: string, rawIndexes: string, lineInfo: string | undefined, close: string) => {
+                const rewrittenIndexes = rawIndexes
+                    .split(/([,、 ]+)/)
+                    .map((part) => {
+                        if (!/^\d+$/.test(part)) {
+                            return part;
+                        }
+
+                        const rawIndex = Number.parseInt(part, 10);
+                        return String(rawToCanonical.get(rawIndex) ?? rawIndex);
+                    })
+                    .join('');
+
+                return `${open}${rewrittenIndexes}${lineInfo ?? ''}${close}`;
+            }
+        );
+    }
+
+    private async rewriteProbeMarkdownCitationIndexes(
+        text: string,
+        sources: DeepResearchSource[],
+        selectedCandidate?: DeepResearchCandidate
+    ): Promise<string> {
+        const citedRawIndexes = this.extractCitationIndices(text);
+        const rawToCanonical = await this.buildCanonicalCitationIndexMap(sources, selectedCandidate?.debugRef, citedRawIndexes);
+
+        if (rawToCanonical.size === 0) {
+            return text;
+        }
+
+        return this.rewriteCitationMarkersToCanonicalIndexes(text, rawToCanonical);
+    }
+
+    private stripExistingSourcesSections(content: string): string {
+        return content
+            .replace(/\s*<section\s[^>]*data-bonsai-(?:observed-)?sources[^>]*>[\s\S]*?<\/section>\s*/gi, '\n\n')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim();
+    }
+
     private appendSourcesToResearchContent(content: string, sources: DeepResearchSource[]): string {
         const trimmedContent = content.trim();
         if (sources.length === 0) {
             return trimmedContent;
         }
 
-        const citedIndices = this.extractCitationIndices(trimmedContent);
+        const contentWithoutSources = this.stripExistingSourcesSections(trimmedContent);
+
+        const citedIndices = this.extractCitationIndices(contentWithoutSources);
         let indexedSources = sources.filter((source): source is DeepResearchSource & { index: number } => source.index !== undefined);
         let observedSources = sources.filter((source) => source.index === undefined);
 
@@ -1015,13 +1745,13 @@ class ChatGPTAdapter extends BaseAdapter {
             observedSources = [];
         }
 
-        const sections = [trimmedContent];
+        const sections = [contentWithoutSources];
 
-        if (indexedSources.length > 0 && !/data-bonsai-sources=/.test(trimmedContent)) {
+        if (indexedSources.length > 0) {
             sections.push(this.buildSourcesSectionHtml('Sources', indexedSources, true));
         }
 
-        if (observedSources.length > 0 && !/data-bonsai-observed-sources=/.test(trimmedContent)) {
+        if (observedSources.length > 0) {
             sections.push(this.buildSourcesSectionHtml(indexedSources.length > 0 ? 'Observed sources' : 'Sources', observedSources, false));
         }
 
@@ -1034,7 +1764,9 @@ class ChatGPTAdapter extends BaseAdapter {
             return trimmedContent;
         }
 
-        const citedIndices = this.extractCitationIndices(trimmedContent);
+        const contentWithoutSources = this.stripExistingSourcesSections(trimmedContent);
+
+        const citedIndices = this.extractCitationIndices(contentWithoutSources);
         let indexedSources = sources.filter((source): source is DeepResearchSource & { index: number } => source.index !== undefined);
         let observedSources = sources.filter((source) => source.index === undefined);
 
@@ -1047,13 +1779,13 @@ class ChatGPTAdapter extends BaseAdapter {
             observedSources = [];
         }
 
-        const sections = [trimmedContent];
+        const sections = [contentWithoutSources];
 
-        if (indexedSources.length > 0 && !/data-bonsai-sources=/.test(trimmedContent)) {
+        if (indexedSources.length > 0) {
             sections.push(this.buildSourcesSectionHtml('Sources', indexedSources, true));
         }
 
-        if (observedSources.length > 0 && !/data-bonsai-observed-sources=/.test(trimmedContent)) {
+        if (observedSources.length > 0) {
             sections.push(this.buildSourcesSectionHtml(indexedSources.length > 0 ? 'Observed sources' : 'Sources', observedSources, false));
         }
 
@@ -1143,8 +1875,140 @@ class ChatGPTAdapter extends BaseAdapter {
             });
     }
 
+    private extractMermaidCodeFromCandidateText(text: string): string | null {
+        const normalized = text.replace(/\r\n?/g, '\n');
+        const fencedMatch = normalized.match(/```mermaid\s*\n([\s\S]*?)```/i);
+        if (fencedMatch?.[1]?.trim()) {
+            return this.decodeMermaidEntities(fencedMatch[1].trim());
+        }
+
+        const lines = normalized.split('\n');
+        const mermaidStartPattern = /^(gantt|flowchart(?:-elk)?|graph|sequenceDiagram|classDiagram|stateDiagram(?:-v2)?|erDiagram|journey|gitGraph|pie|mindmap|timeline|quadrantChart|requirementDiagram|c4context|c4container|c4component|c4dynamic|c4deployment|xychart-beta|block-beta|kanban|packet-beta|architecture(?:-beta)?|sankey-beta)\b/i;
+
+        for (let index = 0; index < lines.length; index += 1) {
+            if (lines[index].trim().toLowerCase() !== 'mermaid') {
+                continue;
+            }
+
+            let start = index + 1;
+            while (start < lines.length && !lines[start].trim()) {
+                start += 1;
+            }
+
+            if (start >= lines.length || !mermaidStartPattern.test(lines[start].trim())) {
+                continue;
+            }
+
+            let end = start + 1;
+            let blankRun = 0;
+
+            for (; end < lines.length; end += 1) {
+                const trimmed = lines[end].trim();
+                if (!trimmed) {
+                    blankRun += 1;
+                    if (blankRun >= 2) {
+                        break;
+                    }
+                    continue;
+                }
+
+                if (end > start + 1 && /^[A-Z][\w\s/&-]{3,}:/.test(trimmed)) {
+                    break;
+                }
+
+                blankRun = 0;
+            }
+
+            const code = lines.slice(start, end).join('\n').trim();
+            if (code) {
+                return this.decodeMermaidEntities(code);
+            }
+        }
+
+        return null;
+    }
+
+    private decodeMermaidEntities(value: string): string {
+        const textarea = document.createElement('textarea');
+        textarea.innerHTML = value;
+        return textarea.value;
+    }
+
+    private findMermaidCodeInCandidates(
+        candidates: DeepResearchCandidate[],
+        selectedCandidate?: DeepResearchCandidate
+    ): string | null {
+        for (const candidate of candidates) {
+            if (candidate === selectedCandidate) {
+                continue;
+            }
+
+            const mermaidCode = this.extractMermaidCodeFromCandidateText(candidate.text);
+            if (mermaidCode) {
+                return mermaidCode;
+            }
+        }
+
+        return null;
+    }
+
+    private injectMermaidCodeIntoResearchHtml(html: string, mermaidCode: string): string {
+        if (!html.trim() || !mermaidCode.trim()) {
+            return html;
+        }
+
+        if (/<code\b[^>]*language-mermaid/i.test(html)) {
+            return html;
+        }
+
+        const parsed = new DOMParser().parseFromString(`<body>${html}</body>`, 'text/html');
+        const body = parsed.body;
+
+        const hasContent = (node: Element): boolean => {
+            if (this.cleanArtifactText(node.textContent ?? '')) {
+                return true;
+            }
+
+            return Boolean(node.querySelector('pre, code, table, ul, ol, li, img, video, audio, canvas, blockquote, p, h1, h2, h3, h4, h5, h6'));
+        };
+
+        Array.from(body.querySelectorAll('div, section, article, figure'))
+            .reverse()
+            .forEach((node) => {
+                if (node.matches('[data-bonsai-sources="true"], [data-bonsai-observed-sources="true"]')) {
+                    return;
+                }
+
+                if (hasContent(node)) {
+                    return;
+                }
+
+                node.remove();
+            });
+
+        const pre = parsed.createElement('pre');
+        const code = parsed.createElement('code');
+        code.className = 'language-mermaid';
+        code.textContent = mermaidCode;
+        pre.append(code);
+
+        const sourceSection = body.querySelector('[data-bonsai-sources="true"], [data-bonsai-observed-sources="true"]');
+        if (sourceSection) {
+            sourceSection.before(pre);
+        } else {
+            body.append(pre);
+        }
+
+        return body.innerHTML.trim();
+    }
+
     private normalizeCandidateText(candidate: { text: string; html?: string }): string {
         return this.cleanArtifactText(candidate.text || (candidate.html ? candidate.html.replace(/<[^>]+>/g, ' ') : ''));
+    }
+
+    private buildProbeEntryDebugRef(snapshotIndex: number, entryIndex: number, kind: string, url?: string): string {
+        const trimmedUrl = this.cleanArtifactText(url ?? '').slice(0, 120);
+        return `snapshot:${snapshotIndex}:entry:${entryIndex}:${kind}${trimmedUrl ? `:${trimmedUrl}` : ''}`;
     }
 
     private async collectProbeCandidatesForEmbed(embed: {
@@ -1158,7 +2022,8 @@ class ChatGPTAdapter extends BaseAdapter {
         const considerCandidate = (
             candidate: { html?: string; text: string; title?: string; url?: string },
             label: string,
-            score: number
+            score: number,
+            debugRef?: string
         ) => {
             const normalizedText = this.normalizeCandidateText(candidate);
             if (!normalizedText || this.isIrrelevantProbePayload(candidate.html ?? normalizedText)) {
@@ -1176,10 +2041,12 @@ class ChatGPTAdapter extends BaseAdapter {
                 html: candidate.html,
                 title: candidate.title,
                 url: candidate.url,
+                debugRef,
             });
         };
 
-        for (const snapshot of snapshots) {
+        for (let snapshotIndex = 0; snapshotIndex < snapshots.length; snapshotIndex += 1) {
+            const snapshot = snapshots[snapshotIndex];
             if (!snapshot.isTop || /oaiusercontent|deep[_-]?research/i.test(snapshot.url)) {
                 const parsedSnapshotHtml = snapshot.bodyHtml
                     ? this.extractFetchedDocumentContent(snapshot.bodyHtml, snapshot.url || window.location.href)
@@ -1191,11 +2058,12 @@ class ChatGPTAdapter extends BaseAdapter {
                         text: parsedSnapshotHtml.text,
                         title: parsedSnapshotHtml.title || snapshot.title,
                         url: snapshot.url,
-                    }, snapshot.isTop ? 'Probe DOM snapshot' : 'Probe frame snapshot', this.scoreProbeCandidate(snapshot.url, parsedSnapshotHtml.title || snapshot.title, parsedSnapshotHtml.text, embed, snapshot.isTop ? 0 : 220));
+                    }, snapshot.isTop ? 'Probe DOM snapshot' : 'Probe frame snapshot', this.scoreProbeCandidate(snapshot.url, parsedSnapshotHtml.title || snapshot.title, parsedSnapshotHtml.text, embed, snapshot.isTop ? 0 : 220), `snapshot:${snapshotIndex}:dom:${this.cleanArtifactText(snapshot.url).slice(0, 120)}`);
                 }
             }
 
-            for (const entry of snapshot.entries) {
+            for (let entryIndex = 0; entryIndex < snapshot.entries.length; entryIndex += 1) {
+                const entry = snapshot.entries[entryIndex];
                 let parsedContent: { html?: string; text: string; title?: string } | null = null;
                 const body = entry.body || '';
                 const contentType = (entry.contentType ?? '').toLowerCase();
@@ -1239,7 +2107,7 @@ class ChatGPTAdapter extends BaseAdapter {
                         ? 400
                         : entry.kind === 'message'
                             ? 260
-                            : 120));
+                            : 120), this.buildProbeEntryDebugRef(snapshotIndex, entryIndex, entry.kind, entry.url || snapshot.url));
             }
         }
 
@@ -1372,6 +2240,14 @@ class ChatGPTAdapter extends BaseAdapter {
             score += 250;
         }
 
+        if (frame.html && /\bdata-citation-index="\d+"/i.test(frame.html)) {
+            score += 2200;
+        }
+
+        if (frame.html && /aria-label="Scroll report to citation \d+"/i.test(frame.html)) {
+            score += 2600;
+        }
+
         score += Math.min(normalizedFrameText.length, 50000) / 100;
 
         return score;
@@ -1381,7 +2257,7 @@ class ChatGPTAdapter extends BaseAdapter {
         title: string;
         sourceUrl?: string;
         viewUrl?: string;
-    }): Promise<{ html?: string; text: string; title?: string; url?: string } | null> {
+    }): Promise<{ html?: string; text: string; title?: string; url?: string; score: number } | null> {
         const frames = await this.getExtractedFrameContent();
         if (frames.length === 0) {
             return null;
@@ -1408,6 +2284,7 @@ class ChatGPTAdapter extends BaseAdapter {
                 text: parsed.text,
                 title: parsed.title || bestFrame.frame.title || embed.title,
                 url: bestFrame.frame.url,
+                score: bestFrame.score,
             };
         }
 
@@ -1417,6 +2294,7 @@ class ChatGPTAdapter extends BaseAdapter {
                 text: plainText,
                 title: bestFrame.frame.title || embed.title,
                 url: bestFrame.frame.url,
+                score: bestFrame.score,
             };
         }
 
@@ -1454,7 +2332,7 @@ class ChatGPTAdapter extends BaseAdapter {
         if (extractedFrame && this.hasMeaningfulArtifactContent(extractedFrame.html ?? extractedFrame.text, title)) {
             candidates.push({
                 label: 'Frame extract',
-                score: 320,
+                score: extractedFrame.score,
                 text: this.cleanArtifactText(extractedFrame.text),
                 html: extractedFrame.html,
                 title: extractedFrame.title || title,
@@ -1559,15 +2437,42 @@ class ChatGPTAdapter extends BaseAdapter {
             }
         }
 
-        const selectedCandidate = this.dedupeDeepResearchCandidates(candidates)[0];
+        const dedupedCandidates = this.dedupeDeepResearchCandidates(candidates);
+        const selectedCandidate = dedupedCandidates[0];
 
         if (selectedCandidate) {
             const sources = await this.collectSourcesForEmbed(embed, selectedCandidate);
+            const resolvedText = selectedCandidate.html
+                ? selectedCandidate.text
+                : await this.rewriteProbeMarkdownCitationIndexes(selectedCandidate.text, sources, selectedCandidate);
+
+            // Diagnostic: identify winning candidate and citation structure
+            const citSnippets = (selectedCandidate.html || resolvedText)
+                .match(/.{0,80}\d{1,3}.{0,80}/g)?.slice(0, 5) || [];
+
+            // Look for sources block at bottom of markdown
+            const sourceMatches = resolvedText?.match(/[^]{0,300}$/);
+
+            console.log(`[Bonsai Citation Debug] Winner: "${selectedCandidate.label}" (score=${selectedCandidate.score})`, {
+                winnerRef: selectedCandidate.debugRef ?? null,
+                hasHtml: !!selectedCandidate.html,
+                citSnippets,
+                sourceCount: sources.length,
+                sources: sources.map(s => ({ i: s.index, url: s.url })),
+                sourceStringTail: sourceMatches ? sourceMatches[0] : null
+            });
 
             title = selectedCandidate.title || title;
-            content = selectedCandidate.html
-                ? this.appendSourcesToResearchHtml(selectedCandidate.html, sources)
-                : this.appendSourcesToResearchContent(selectedCandidate.text, sources);
+            if (selectedCandidate.html) {
+                const mermaidCode = this.findMermaidCodeInCandidates(dedupedCandidates, selectedCandidate);
+                const resolvedHtml = mermaidCode
+                    ? this.injectMermaidCodeIntoResearchHtml(selectedCandidate.html, mermaidCode)
+                    : selectedCandidate.html;
+
+                content = this.appendSourcesToResearchHtml(resolvedHtml, sources);
+            } else {
+                content = this.appendSourcesToResearchContent(resolvedText, sources);
+            }
             mimeType = selectedCandidate.html ? 'text/html' : 'text/markdown';
             artifactType = 'deep_research';
             sourceUrl = undefined;
@@ -2494,9 +3399,35 @@ class ChatGPTAdapter extends BaseAdapter {
         return text;
     }
 
+    private hasMeaningfulMessageNode(message: MessageNode): boolean {
+        if (message.artifact_ids.length > 0) {
+            return true;
+        }
+
+        return message.content_blocks.some((block) => {
+            switch (block.type) {
+                case 'markdown':
+                case 'text':
+                case 'code':
+                    return block.value.trim().length > 0;
+                case 'html':
+                    return block.value.replace(/<[^>]*>/g, ' ').trim().length > 0;
+                case 'list':
+                    return block.items.some((item) => item.trim().length > 0);
+                case 'table':
+                    return block.rows.some((row) => row.some((cell) => cell.trim().length > 0));
+                case 'image_ref':
+                    return block.artifact_id.trim().length > 0;
+                default:
+                    return false;
+            }
+        });
+    }
+
     async captureConversation(): Promise<ConversationGraph> {
         this.extractedFrameContentPromise = null;
         this.openAIProbeSnapshotsPromise = null;
+        const projectInfo = this.getCurrentProjectInfo();
 
         // Remove stale data-bonsai-index attributes left by previous capture attempts
         // so extractCodeBlocks doesn't skip already-tagged elements.
@@ -2559,6 +3490,11 @@ class ChatGPTAdapter extends BaseAdapter {
             this.linkDeepResearchLabels(message, msgArtifacts, allDeepResearchArtifacts);
         });
 
+        const filteredMessages = messages.filter((message) => this.hasMeaningfulMessageNode(message));
+        filteredMessages.forEach((message, sequence) => {
+            message.sequence = sequence;
+        });
+
         return {
             conversation_id: crypto.randomUUID(),
             title,
@@ -2568,8 +3504,16 @@ class ChatGPTAdapter extends BaseAdapter {
                 captured_at: new Date().toISOString(),
                 capture_version: '0.1.0'
             },
+            ...(projectInfo
+                ? {
+                    source_folder: {
+                        name: projectInfo.name,
+                        url: projectInfo.url,
+                    },
+                }
+                : {}),
             provenance: this.getProvenance(),
-            messages,
+            messages: filteredMessages,
             artifacts: allArtifacts
         };
     }

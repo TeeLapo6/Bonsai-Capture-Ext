@@ -10,8 +10,10 @@ const ADAPTERS = {
     'content/chatgpt_probe': 'src/content/chatgpt_probe.ts',
     'content/chatgpt': 'src/content/adapters/chatgpt.ts',
     'content/claude': 'src/content/adapters/claude.ts',
+    'content/iframe_extractor': 'src/content/iframe-extractor.ts',
     'content/gemini': 'src/content/adapters/gemini.ts',
-    'content/grok': 'src/content/adapters/grok.ts'
+    'content/grok': 'src/content/adapters/grok.ts',
+    'content/augure': 'src/content/adapters/augure.ts'
 };
 
 async function buildAll() {
