@@ -2833,6 +2833,94 @@ export class ClaudeAdapter extends BaseAdapter {
             });
         });
 
+        // Capture interactive #vis-container HTML blocks rendered inside Claude artifact
+        // iframes (claudeusercontent.com) or directly on the page.  These are typically
+        // D3/charting visualisations that don't surface in the regular artifact panel
+        // capture pipeline because they live in cross-origin frames.
+        try {
+            const visArtifacts = await this.captureVisContainerArtifacts();
+            for (const visArtifact of visArtifacts) {
+                if (artifacts.some((a) => a.artifact_id === visArtifact.artifact_id)) continue;
+                artifacts.push(visArtifact);
+            }
+        } catch (visError) {
+            console.warn('[Bonsai] Claude parseArtifacts: failed to capture vis-container artifacts', visError);
+        }
+
+        return artifacts;
+    }
+
+    /**
+     * Capture interactive HTML rendered into <div id="vis-container"> elements.
+     * These typically live inside Claude's cross-origin artifact iframe
+     * (claudeusercontent.com) where the content script cannot reach directly,
+     * so we ask the background service worker to inject an extractor into all
+     * frames via chrome.scripting.executeScript({ allFrames: true }).
+     *
+     * The extractor returns the container's outerHTML with computed styles
+     * inlined onto every descendant — yielding a self-contained snapshot that
+     * can be re-rendered inside an <iframe srcdoc="..."> in the HTML export.
+     */
+    private async captureVisContainerArtifacts(): Promise<ArtifactNode[]> {
+        if (typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) {
+            return [];
+        }
+
+        type VisContainerResponse = {
+            containers?: Array<{
+                frameId?: number;
+                frameUrl?: string;
+                frameTitle?: string;
+                index?: number;
+                title?: string;
+                html?: string;
+                rawHtml?: string;
+                rect?: { width: number; height: number };
+            }>;
+            error?: string;
+        };
+
+        let response: VisContainerResponse | null = null;
+        try {
+            response = await chrome.runtime.sendMessage({ type: 'EXTRACT_VIS_CONTAINERS' }) as VisContainerResponse;
+        } catch (err) {
+            console.warn('[Bonsai] Claude vis-container: messaging failed', err);
+            return [];
+        }
+
+        const containers = response?.containers ?? [];
+        if (!Array.isArray(containers) || containers.length === 0) {
+            return [];
+        }
+
+        const seen = new Set<string>();
+        const artifacts: ArtifactNode[] = [];
+        const conversationUrl = window.location.href;
+
+        for (const c of containers) {
+            const html = (c.html ?? c.rawHtml ?? '').trim();
+            if (!html) continue;
+
+            // Dedupe identical snapshots (same frame may appear multiple times across runs)
+            const dedupeKey = `${c.frameUrl ?? ''}|${c.index ?? 0}|${html.length}`;
+            if (seen.has(dedupeKey)) continue;
+            seen.add(dedupeKey);
+
+            const title = (c.title || c.frameTitle || 'Interactive visualization').slice(0, 200);
+
+            artifacts.push({
+                artifact_id: `vis-container-${c.frameId ?? 'top'}-${c.index ?? 0}-${crypto.randomUUID().slice(0, 8)}`,
+                type: 'interactive_html',
+                title,
+                mime_type: 'text/html',
+                content: html,
+                source_message_id: '',
+                source_url: c.frameUrl ?? conversationUrl,
+                view_url: c.frameUrl ?? conversationUrl,
+                exportable: true,
+            });
+        }
+
         return artifacts;
     }
 

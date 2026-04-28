@@ -1345,4 +1345,65 @@ describe('ClaudeAdapter code artifact capture', () => {
         expect(graph!.artifacts[0].artifact_id).toBe('artifact-visible-dedup');
         expect(String(graph!.artifacts[0].content)).toContain('This is the full plan content.');
     });
+
+    it('captures interactive HTML from #vis-container via background extraction', async () => {
+        const sendMessageMock = vi.fn().mockResolvedValue({
+            containers: [
+                {
+                    frameId: 7,
+                    frameUrl: 'https://abcd.claudeusercontent.com/sandbox',
+                    frameTitle: 'Claude visualization',
+                    index: 0,
+                    title: 'Sales Chart',
+                    html: '<div id="vis-container" style="width: 600px; height: 400px;"><svg><rect width="10" height="10"></rect></svg></div>',
+                    rawHtml: '<div id="vis-container"><svg></svg></div>',
+                    rect: { width: 600, height: 400 },
+                },
+            ],
+        });
+
+        (globalThis as unknown as { chrome: { runtime: { sendMessage: typeof sendMessageMock } } }).chrome.runtime.sendMessage = sendMessageMock;
+
+        const adapter = new ClaudeAdapterClass();
+
+        document.body.innerHTML = `
+            <div id="main-content">
+                <div data-testid="user-message">Render a chart please</div>
+                <div class="font-claude-response">Here is your chart.</div>
+            </div>
+        `;
+
+        const messageEl = document.querySelector('.font-claude-response') as Element;
+        const artifacts = await adapter.parseArtifacts(messageEl);
+
+        expect(sendMessageMock).toHaveBeenCalledWith({ type: 'EXTRACT_VIS_CONTAINERS' });
+
+        const visArtifacts = artifacts.filter((a) => a.type === 'interactive_html');
+        expect(visArtifacts).toHaveLength(1);
+        expect(visArtifacts[0].title).toBe('Sales Chart');
+        expect(visArtifacts[0].mime_type).toBe('text/html');
+        expect(visArtifacts[0].source_url).toBe('https://abcd.claudeusercontent.com/sandbox');
+        expect(String(visArtifacts[0].content)).toContain('vis-container');
+        expect(String(visArtifacts[0].content)).toContain('<svg>');
+    });
+
+    it('skips vis-container capture gracefully when background returns no containers', async () => {
+        const sendMessageMock = vi.fn().mockResolvedValue({ containers: [] });
+        (globalThis as unknown as { chrome: { runtime: { sendMessage: typeof sendMessageMock } } }).chrome.runtime.sendMessage = sendMessageMock;
+
+        const adapter = new ClaudeAdapterClass();
+
+        document.body.innerHTML = `
+            <div id="main-content">
+                <div data-testid="user-message">Hi</div>
+                <div class="font-claude-response">Hello</div>
+            </div>
+        `;
+
+        const messageEl = document.querySelector('.font-claude-response') as Element;
+        const artifacts = await adapter.parseArtifacts(messageEl);
+
+        expect(sendMessageMock).toHaveBeenCalledWith({ type: 'EXTRACT_VIS_CONTAINERS' });
+        expect(artifacts.filter((a) => a.type === 'interactive_html')).toHaveLength(0);
+    });
 });

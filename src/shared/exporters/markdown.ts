@@ -176,6 +176,8 @@ function formatArtifactContent(artifact: ArtifactNode): string {
         return `${renderDeepResearchContentForMarkdown(artifact, artifact.content)}\n\n`;
     } else if (artifact.type === 'code_artifact' && typeof artifact.content === 'string') {
         return `\`\`\`\n${artifact.content}\n\`\`\`\n\n`;
+    } else if (artifact.type === 'interactive_html' && typeof artifact.content === 'string') {
+        return `\`\`\`html\n${artifact.content}\n\`\`\`\n\n`;
     } else if (typeof artifact.content === 'string') {
         return `${artifact.content}\n\n`;
     }

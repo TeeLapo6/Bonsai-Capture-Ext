@@ -292,6 +292,10 @@ function shouldRenderArtifactInAppendix(artifact: ArtifactNode, artifactMode: 'i
         return typeof artifact.content === 'string' && artifact.content.trim().length > 0;
     }
 
+    if (artifact.type === 'interactive_html') {
+        return typeof artifact.content === 'string' && artifact.content.trim().length > 0;
+    }
+
     if (artifact.type === 'deep_research' || artifact.type === 'file') {
         return true;
     }
@@ -385,6 +389,16 @@ function renderArtifact(artifact: ArtifactNode): string {
 
     if (artifact.type === 'code_artifact' && typeof artifact.content === 'string') {
         html += `<pre><code>${escapeHtml(artifact.content)}</code></pre>`;
+        html += '</section>';
+        return html;
+    }
+
+    if (artifact.type === 'interactive_html' && typeof artifact.content === 'string') {
+        // Render as a sandboxed iframe srcdoc so the captured interactive HTML
+        // (e.g. Claude visualisation rendered in <div id="vis-container">) is
+        // re-displayed live inside the export, isolated from the host document.
+        html += `<iframe sandbox="allow-scripts" srcdoc="${escapeAttribute(artifact.content)}" title="${escapeAttribute(artifact.title ?? 'Interactive visualization')}" style="display:block; width:100%; min-height:480px; border:1px solid #d0d7de; border-radius:8px; background:#fff;"></iframe>`;
+        html += `<details><summary>View HTML source</summary><pre><code>${escapeHtml(artifact.content)}</code></pre></details>`;
         html += '</section>';
         return html;
     }

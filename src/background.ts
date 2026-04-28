@@ -791,6 +791,121 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true;
     }
 
+    if (message.type === 'EXTRACT_VIS_CONTAINERS') {
+        // Extract <div id="vis-container"> contents from all frames in the active tab
+        // (including cross-origin Claude artifact iframes such as claudeusercontent.com).
+        // We inline a curated list of computed styles onto every element so the snapshot
+        // is self-rendering in <iframe srcdoc="..."> when later displayed.
+        (async () => {
+            if (!sender.tab?.id) {
+                sendResponse({ containers: [], error: 'Missing sender tab id' });
+                return;
+            }
+
+            try {
+                const results = await chrome.scripting.executeScript({
+                    target: {
+                        tabId: sender.tab.id,
+                        allFrames: true,
+                    },
+                    func: () => {
+                        // Curated set of CSS properties that capture visual layout/styling
+                        // without bloating the snapshot with every inherited default.
+                        const STYLE_PROPS = [
+                            'display', 'position', 'top', 'right', 'bottom', 'left', 'z-index',
+                            'width', 'height', 'min-width', 'min-height', 'max-width', 'max-height',
+                            'margin', 'padding', 'box-sizing', 'overflow',
+                            'flex', 'flex-direction', 'flex-wrap', 'justify-content', 'align-items',
+                            'align-content', 'align-self', 'gap', 'grid-template-columns',
+                            'grid-template-rows', 'grid-area',
+                            'color', 'background', 'background-color', 'background-image',
+                            'background-size', 'background-position', 'background-repeat',
+                            'border', 'border-radius', 'box-shadow', 'outline',
+                            'font-family', 'font-size', 'font-weight', 'font-style', 'line-height',
+                            'letter-spacing', 'text-align', 'text-decoration', 'text-transform',
+                            'white-space', 'word-break',
+                            'opacity', 'visibility', 'transform', 'transform-origin', 'transition',
+                            'cursor', 'pointer-events', 'fill', 'stroke', 'stroke-width',
+                        ];
+
+                        const inlineComputedStyles = (root: Element): void => {
+                            const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                            let node: Element | null = root;
+                            while (node) {
+                                try {
+                                    const computed = window.getComputedStyle(node);
+                                    const declarations: string[] = [];
+                                    for (const prop of STYLE_PROPS) {
+                                        const value = computed.getPropertyValue(prop);
+                                        if (value && value !== 'normal' && value !== 'auto' && value !== 'none') {
+                                            declarations.push(`${prop}: ${value}`);
+                                        }
+                                    }
+                                    if (declarations.length) {
+                                        const existing = node.getAttribute('style') ?? '';
+                                        const combined = existing
+                                            ? `${declarations.join('; ')}; ${existing}`
+                                            : declarations.join('; ');
+                                        node.setAttribute('style', combined);
+                                    }
+                                } catch {
+                                    // Skip elements where computed styles cannot be read
+                                }
+                                node = walker.nextNode() as Element | null;
+                            }
+                        };
+
+                        const containers = Array.from(document.querySelectorAll('div#vis-container, div[id="vis-container"]'));
+                        if (containers.length === 0) {
+                            return { url: location.href, title: document.title, containers: [] };
+                        }
+
+                        const snapshots = containers.map((container, index) => {
+                            // Clone so we don't mutate the live page
+                            const clone = container.cloneNode(true) as Element;
+                            try {
+                                inlineComputedStyles(clone);
+                            } catch {
+                                // Ignore failures; the raw outerHTML is still useful
+                            }
+
+                            const heading = container.querySelector('h1, h2, h3, [role="heading"], title')?.textContent?.trim();
+
+                            return {
+                                index,
+                                title: heading || document.title || 'Interactive visualization',
+                                html: (clone as HTMLElement).outerHTML,
+                                rawHtml: (container as HTMLElement).outerHTML,
+                                rect: (() => {
+                                    const r = container.getBoundingClientRect();
+                                    return { width: Math.round(r.width), height: Math.round(r.height) };
+                                })(),
+                            };
+                        });
+
+                        return { url: location.href, title: document.title, containers: snapshots };
+                    },
+                });
+
+                const containers = results.flatMap((result) => {
+                    const frame = result.result;
+                    if (!frame || !Array.isArray(frame.containers)) return [];
+                    return frame.containers.map((c: { index: number; title: string; html: string; rawHtml: string; rect: { width: number; height: number } }) => ({
+                        frameId: result.frameId,
+                        frameUrl: frame.url,
+                        frameTitle: frame.title,
+                        ...c,
+                    }));
+                });
+
+                sendResponse({ containers });
+            } catch (error) {
+                sendResponse({ containers: [], error: String(error) });
+            }
+        })();
+        return true;
+    }
+
     return false;
 });
 

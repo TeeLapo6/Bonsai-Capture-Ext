@@ -30,7 +30,8 @@
     "https://grok.com/*",
     "https://*.oaiusercontent.com/*",
     "https://*.googleusercontent.com/*",
-    "https://*.usercontent.google.com/*"
+    "https://*.usercontent.google.com/*",
+    "https://*.claudeusercontent.com/*"
   ],
   "background": {
     "service_worker": "background.js",

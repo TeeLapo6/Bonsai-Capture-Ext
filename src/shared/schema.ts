@@ -121,7 +121,8 @@ export type ArtifactType =
     | 'deep_research'
     | 'file'
     | 'canvas'
-    | 'code_artifact';
+    | 'code_artifact'
+    | 'interactive_html';
 
 export interface ArtifactNode {
     artifact_id: string;
