@@ -2,4 +2,12 @@ node_modules/
 .playwright/
 runs/
 test-results/
-playwright-report/
+playwright-report/-e 
+# Environment and credential files
+.env
+.env.*
+*.env
+credentials.json
+*.pem
+*.key
+.credentials
